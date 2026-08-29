@@ -1,0 +1,20 @@
+# Local test/dev DB files -- these are created fresh by each test run
+# and by local uvicorn runs; never commit them (production uses Postgres
+# via DATABASE_URL, not these).
+*.db
+pmc_local.db
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Env files -- if you ever create a local .env for testing, never commit it
+.env
+.env.local
+
+# real_data/ is large, real captured API responses used only by
+# test_ngx_pulse_service.py -- optional to commit; include it if you want
+# CI/collaborators to be able to run that specific test, omit it to keep
+# the repo lean. Not needed for production deployment either way.
