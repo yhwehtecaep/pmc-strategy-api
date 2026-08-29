@@ -1,0 +1,50 @@
+databases:
+  - name: pmc-strategy-db
+    plan: free
+    region: oregon
+    databaseName: pmc_strategy
+    user: pmc_strategy_user
+    # NOTE: Render's free Postgres tier expires 90 days after creation
+    # and must be manually recreated (new instance, new connection
+    # string) unless upgraded to a paid plan or migrated off before
+    # then. The competition's active window is 9 months -- this WILL
+    # expire mid-competition. Plan the Supabase migration date now,
+    # don't let this become a surprise outage.
+
+services:
+  - type: web
+    name: pmc-strategy-api
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      # Wired automatically to the database above -- Render fills this in,
+      # no manual copy/paste needed. db.py normalizes postgres:// ->
+      # postgresql:// internally, so the connection string works as-is.
+      # TO MIGRATE TO SUPABASE LATER: change this block to
+      # `- key: DATABASE_URL` / `sync: false`, remove the `databases:`
+      # block above, redeploy, then paste your Supabase URI into the
+      # Render dashboard when prompted. Existing data does NOT move
+      # automatically -- export/import (pg_dump/pg_restore, or db.py's
+      # own read/write functions) is a separate step when that day comes.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pmc-strategy-db
+          property: connectionString
+
+      # sync: false = secret, prompted for in the Render dashboard on
+      # first deploy, never stored in this file or committed to git.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: NGX_PULSE_API_KEY
+        sync: false
+
+      # Not secret -- the documented default, safe to commit. Override in
+      # the dashboard only if NGX Pulse's base URL ever changes.
+      - key: NGX_PULSE_BASE_URL
+        value: https://ngxpulse.ng

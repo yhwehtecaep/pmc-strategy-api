@@ -1,0 +1,10 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pandas==3.0.2
+numpy==2.4.4
+requests==2.33.1
+lxml==6.0.2
+pydantic==2.13.4
+sqlalchemy==2.0.52
+psycopg2-binary==2.9.12
+httpx==0.28.1  # test-only: required by fastapi.testclient.TestClient in test_main.py, not by the running app
