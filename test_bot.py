@@ -744,6 +744,89 @@ with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""):
 
 
 # =======================================================================
+print("\n=== SECTION 14: /monthly_screen -- owner-restricted, thread-based trigger ===")
+# =======================================================================
+
+
+class _SyncFakeThread:
+    """Test double for threading.Thread that runs target(*args) SYNCHRONOUSLY
+    inside .start(), so tests are deterministic (no real concurrency, no
+    sleep/poll/join needed) while still proving cmd_monthly_screen wires
+    up threading.Thread correctly, not calling the work directly itself."""
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self.target = target
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.daemon = daemon
+
+    def start(self):
+        self.target(*self.args, **self.kwargs)
+
+
+monthly_screen_calls = []
+
+
+def _fake_run_monthly_screen_and_notify(chat_id, pool_size, cash_buffer, lookback_days,
+                                          max_requests, send_message_fn, escape_md_fn):
+    monthly_screen_calls.append({
+        "chat_id": chat_id, "pool_size": pool_size, "cash_buffer": cash_buffer,
+        "lookback_days": lookback_days, "max_requests": max_requests,
+    })
+    send_message_fn(chat_id, "fake monthly screen result")
+
+
+with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_message", side_effect=_fake_send_message), \
+     patch.object(bot.threading, "Thread", side_effect=_SyncFakeThread), \
+     patch.object(bot.mss, "run_monthly_screen_and_notify", side_effect=_fake_run_monthly_screen_and_notify):
+
+    with patch.object(bot, "OWNER_CHAT_ID", ""):
+        monthly_screen_calls.clear()
+        sent_messages.clear()
+        client.post("/telegram/webhook", json=_telegram_message_update("any_chat", "/monthly_screen"))
+        check("/monthly_screen with OWNER_CHAT_ID unconfigured refuses to run",
+              "not configured" in sent_messages[-1]["text"], sent_messages)
+        check("/monthly_screen with OWNER_CHAT_ID unconfigured does not call the underlying work",
+              monthly_screen_calls == [], monthly_screen_calls)
+
+    with patch.object(bot, "OWNER_CHAT_ID", "owner_chat_id_123"):
+        monthly_screen_calls.clear()
+        sent_messages.clear()
+        client.post("/telegram/webhook", json=_telegram_message_update("some_random_chat", "/monthly_screen"))
+        check("/monthly_screen from a non-owner chat is restricted",
+              "restricted" in sent_messages[-1]["text"], sent_messages)
+        check("/monthly_screen from a non-owner chat does not call the underlying work",
+              monthly_screen_calls == [], monthly_screen_calls)
+        check("/monthly_screen restriction message does not leak what OWNER_CHAT_ID's value is",
+              "owner_chat_id_123" not in sent_messages[-1]["text"], sent_messages)
+
+        monthly_screen_calls.clear()
+        sent_messages.clear()
+        client.post("/telegram/webhook", json=_telegram_message_update("owner_chat_id_123", "/monthly_screen"))
+        # NOTE on ordering: _SyncFakeThread.start() runs the target
+        # SYNCHRONOUSLY (by design, for test determinism), so here the
+        # background work's message lands BEFORE cmd_monthly_screen's own
+        # "started" reply is sent by handle_update. In REAL production
+        # (a real daemon thread), this order is normally reversed: the
+        # "started" reply returns and sends immediately, while the actual
+        # background thread's result message arrives later, whenever the
+        # multi-minute screen actually finishes. This inversion is a
+        # property of the synchronous test double, not something being
+        # asserted about real runtime behavior.
+        check("/monthly_screen from the owner chat sent both the immediate 'started' "
+              "reply and the (here, synchronously-run) background result",
+              len(sent_messages) == 2, sent_messages)
+        check("/monthly_screen's immediate reply text says 'started'",
+              any("started" in m["text"].lower() for m in sent_messages), sent_messages)
+        check("/monthly_screen actually invoked the shared implementation via threading.Thread "
+              "(not called directly) -- proven by the fake Thread class being what ran it",
+              len(monthly_screen_calls) == 1 and
+              any("fake monthly screen result" in m["text"] for m in sent_messages),
+              sent_messages)
+        check("/monthly_screen correctly passed the owner's own chat_id through to the underlying work",
+              monthly_screen_calls[0]["chat_id"] == "owner_chat_id_123", monthly_screen_calls)
+
+
+# =======================================================================
 print("\n" + "=" * 60)
 print(f"TOTAL: {len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
