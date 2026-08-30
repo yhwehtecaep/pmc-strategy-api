@@ -17,11 +17,13 @@ from portfolio_service import (
     check_drift,
     check_hard_breaches,
     estimate_trade_fees,
+    identify_diversification_additions,
     MAX_STOCK_WEIGHT,
     MAX_SECTOR_WEIGHT,
     MAX_CASH,
     BUY_FEE_RATE,
     SELL_FEE_RATE,
+    DIVERSIFICATION_FLOOR,
 )
 
 PASS = []
@@ -303,6 +305,60 @@ fee9e = estimate_trade_fees(sell_amount=0.08, buy_amount=0.08)
 expected9e = 0.08 * (0.0218 + 0.0153)
 check("T9e: symmetric swap trade fee = 8% * (sell+buy rates)", close(fee9e, expected9e),
       f"got={fee9e}, expected={expected9e}, drag={fee9e*100:.3f}% of portfolio")
+
+
+# ---------------------------------------------------------------------
+# identify_diversification_additions -- the v8-documented diversification
+# floor logic (DIVERSIFICATION_FLOOR=10, distinct from the hard 5-holding
+# minimum) that was declared but never implemented until now.
+# ---------------------------------------------------------------------
+
+# Already at/above the floor -- no additions needed regardless of pool content
+already_at_floor = [f"H{i}" for i in range(10)]  # 10 held names
+pool_full = [f"H{i}" for i in range(10)] + [f"NEW{i}" for i in range(5)]
+additions_at_floor = identify_diversification_additions(already_at_floor, pool_full)
+check("T10a: exactly AT the floor (10 held) needs zero additions",
+      additions_at_floor == [], additions_at_floor)
+
+above_floor = [f"H{i}" for i in range(12)]  # 12 held, above the floor
+additions_above = identify_diversification_additions(above_floor, pool_full)
+check("T10b: ABOVE the floor needs zero additions", additions_above == [], additions_above)
+
+# Below the floor -- needs exactly (floor - held) new names, in rank order
+below_floor = [f"H{i}" for i in range(7)]  # 7 held, floor is 10 -> need 3
+ranked_pool = [f"H{i}" for i in range(7)] + ["BEST", "SECOND", "THIRD", "FOURTH"]
+additions_below = identify_diversification_additions(below_floor, ranked_pool)
+check("T10c: 7 held (floor=10) needs exactly 3 additions", len(additions_below) == 3, additions_below)
+check("T10c: additions are the BEST-RANKED eligible names not already held, in rank order",
+      additions_below == ["BEST", "SECOND", "THIRD"], additions_below)
+check("T10c: none of the additions are already-held symbols",
+      set(additions_below).isdisjoint(set(below_floor)), additions_below)
+
+# Below the floor, but the ranked pool doesn't have enough NEW names to fill it --
+# returns as many as available, doesn't crash or fabricate symbols
+tiny_pool = [f"H{i}" for i in range(7)] + ["ONLYONE"]
+additions_shortfall = identify_diversification_additions(below_floor, tiny_pool)
+check("T10d: fewer available new names than needed returns only what's actually available (1, not 3)",
+      additions_shortfall == ["ONLYONE"], additions_shortfall)
+
+# Custom floor parameter
+additions_custom_floor = identify_diversification_additions(
+    below_floor, ranked_pool, floor=8,  # only need 1 more to reach a floor of 8
+)
+check("T10e: custom floor parameter is respected (floor=8, 7 held -> need only 1)",
+      additions_custom_floor == ["BEST"], additions_custom_floor)
+
+# Order-independence of current_symbols input (set semantics, not list-order-sensitive)
+additions_shuffled = identify_diversification_additions(
+    list(reversed(below_floor)), ranked_pool,
+)
+check("T10f: current_symbols order doesn't affect the result (set semantics internally)",
+      additions_shuffled == ["BEST", "SECOND", "THIRD"], additions_shuffled)
+
+# Empty current holdings -- fresh portfolio, needs the full floor from the pool
+additions_empty = identify_diversification_additions([], ranked_pool)
+check("T10g: zero current holdings needs the full floor (10) worth of additions, or as many as the pool has",
+      len(additions_empty) == min(DIVERSIFICATION_FLOOR, len(ranked_pool)), additions_empty)
 
 
 # ---------------------------------------------------------------------
