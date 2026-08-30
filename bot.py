@@ -46,10 +46,27 @@ exercises webhook parsing/dispatch/db-wiring end-to-end via TestClient,
 the same pattern test_main.py used for mocked fundamentals_service calls.
 Live delivery to a real Telegram chat must be verified by the user after
 deployment (see the setWebhook instructions given alongside this file).
+
+/monthly_screen: manually triggers the exact same live-universe-screen
+work main.py's POST /monthly-screen endpoint runs automatically at
+month-end -- both call monthly_screen_service.run_monthly_screen_and_notify
+directly, not two separate implementations (see that module's docstring
+for why it's a standalone module: main.py imports bot.py, so bot.py can't
+import main.py back without a circular import). Unlike every other
+command in this bot -- which is deliberately open to any chat that
+messages it -- this one is restricted to OWNER_CHAT_ID, since it triggers
+real NGX Pulse quota usage and several minutes of stockanalysis.com
+scraping every time it's called; there's no other access control on this
+bot, so this is the one command where that actually matters. Runs in a
+daemon thread rather than synchronously in the webhook handler, for the
+same reason main.py uses BackgroundTasks: the multi-minute runtime would
+otherwise hold the /telegram/webhook request open past Telegram's own
+delivery timeout, causing a duplicate-delivery retry.
 """
 
 import os
 import shlex
+import threading
 from datetime import datetime
 from typing import Optional
 
@@ -58,9 +75,11 @@ import requests
 import db
 import ngx_pulse_service as nps
 import portfolio_service as psvc
+import monthly_screen_service as mss
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID", "")
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
@@ -239,10 +258,12 @@ def cmd_help(chat_id: str, args: list) -> str:
         "/trades -- show the active portfolio's recent trade history (with ids for /undo\\_trade)\n"
         "/signals -- show unacknowledged drift/breach signals\n"
         "/ack signal\\_id -- acknowledge a signal (full id or its first 8 chars)\n"
+        "/monthly\\_screen -- manually trigger a live universe screen + portfolio "
+        "construction (owner only); normally runs automatically at month-end\n"
         "/help -- show this message\n\n"
-        "Not yet available here: screening, portfolio construction, and drift "
-        "checks -- these need the full strategy compute layer (main.py's job, "
-        "not this bot's)."
+        "Not yet available here: portfolio construction against arbitrary custom "
+        "parameters, and drift/breach checks -- those still need main.py's "
+        "/portfolio/construct and /rebalance-check directly."
     )
 
 
@@ -492,6 +513,32 @@ def cmd_undo_trade(chat_id: str, args: list) -> str:
     return summary
 
 
+def cmd_monthly_screen(chat_id: str, args: list) -> str:
+    """Manually triggers the same live-universe screen + portfolio
+    construction the scheduled GitHub Actions workflow runs automatically
+    at month-end. See module docstring for why this is restricted to
+    OWNER_CHAT_ID and why it runs in a background thread."""
+    if not OWNER_CHAT_ID:
+        return "OWNER\\_CHAT\\_ID is not configured on this deployment -- refusing to run. See deployment notes."
+    if chat_id != OWNER_CHAT_ID:
+        # Deliberately vague -- same principle as not confirming/denying
+        # whether an account exists on a login form. Anyone else messaging
+        # this bot gets no signal about what OWNER_CHAT_ID even controls.
+        return "This command is restricted."
+
+    thread = threading.Thread(
+        target=mss.run_monthly_screen_and_notify,
+        args=(chat_id, 15, psvc.CASH_BUFFER, nps.DEFAULT_LOOKBACK_DAYS, 90, send_message, _escape_md),
+        daemon=True,
+    )
+    thread.start()
+    return (
+        "Monthly screen started -- this takes several minutes (live NGX Pulse pull + "
+        "fundamentals scraping for every eligible symbol). Results will follow as a "
+        "separate message."
+    )
+
+
 def cmd_ack(chat_id: str, args: list) -> str:
     if not args:
         return "Usage: /ack signal\\_id"
@@ -521,6 +568,7 @@ COMMANDS = {
     "/trades": cmd_trades,
     "/signals": cmd_signals,
     "/ack": cmd_ack,
+    "/monthly_screen": cmd_monthly_screen,
 }
 
 
