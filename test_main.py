@@ -37,6 +37,9 @@ from unittest.mock import patch
 
 import fundamentals_service as fs
 import ngx_pulse_service as nps
+import universe_service as us
+import portfolio_service as ps
+import bot as tg_bot
 import requests
 from fastapi.testclient import TestClient
 
@@ -503,6 +506,177 @@ with patch.object(fs, "get_point_in_time_fundamentals", side_effect=_mock_fundam
     # here is that the pulled-back weights match the constructed target, above.
     check("E2E: drift_rows cover all constructed symbols (holdings round-trip didn't drop any)",
           {row["symbol"] for row in rc["drift_rows"]} == set(constructed["weights"].keys()), rc)
+
+
+# =======================================================================
+print("\n=== SECTION 8: /monthly-screen -- automated live-universe screen + notify ===")
+# =======================================================================
+
+_MONTHLY_UNIVERSE_SYMBOLS = ["DANGCEM", "GTCO", "ZENITHBANK", "MTNN", "FIDELITYBK", "SEPLAT"]
+_MONTHLY_SECTORS = {
+    "DANGCEM": "Industrial Goods", "GTCO": "Banking", "ZENITHBANK": "Banking",
+    "MTNN": "Telecom", "FIDELITYBK": "Banking", "SEPLAT": "Oil and Gas",
+}
+_MONTHLY_PRICES = {"DANGCEM": 350.0, "GTCO": 45.0, "ZENITHBANK": 40.0, "MTNN": 200.0, "FIDELITYBK": 15.0, "SEPLAT": 3500.0}
+
+
+def _mock_build_live_universe(*a, **kw):
+    return list(_MONTHLY_UNIVERSE_SYMBOLS), dict(_MONTHLY_SECTORS), dict(_MONTHLY_PRICES)
+
+
+def _mock_get_price_series_for_symbols(symbols, days=130, max_requests=100):
+    import pandas as pd
+    series = {
+        sym: pd.Series(
+            [100 + i + (0 if sym != "DANGCEM" else i * 2) for i in range(130)],
+        )
+        for sym in symbols
+    }
+    return series, []
+
+
+sent_to_telegram = []
+
+
+def _fake_send_message(chat_id, text, parse_mode="Markdown"):
+    sent_to_telegram.append({"chat_id": chat_id, "text": text})
+    return None
+
+
+print("\n--- Auth ---")
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", "s3cr3t"):
+    r = client.post("/monthly-screen", json={"chat_id": "chat1"})
+    check("POST /monthly-screen without secret header returns 401 when secret is configured",
+          r.status_code == 401, r.text)
+
+    r = client.post("/monthly-screen", json={"chat_id": "chat1"},
+                     headers={"X-Monthly-Screen-Secret": "wrong"})
+    check("POST /monthly-screen with wrong secret returns 401", r.status_code == 401, r.text)
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", ""):
+    with patch.object(us, "build_live_universe", side_effect=_mock_build_live_universe), \
+         patch.object(nps, "get_price_series_for_symbols", side_effect=_mock_get_price_series_for_symbols), \
+         patch.object(fs, "get_point_in_time_fundamentals", side_effect=_mock_fundamentals), \
+         patch.object(tg_bot, "send_message", side_effect=_fake_send_message):
+        sent_to_telegram.clear()
+        r = client.post("/monthly-screen", json={"chat_id": "chat_no_secret"})
+        check("POST /monthly-screen with no secret configured succeeds (matches webhook secret pattern)",
+              r.status_code == 200, r.text)
+
+
+print("\n--- Successful run: builds universe, screens, constructs, notifies via Telegram ---")
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", ""), \
+     patch.object(us, "build_live_universe", side_effect=_mock_build_live_universe), \
+     patch.object(nps, "get_price_series_for_symbols", side_effect=_mock_get_price_series_for_symbols), \
+     patch.object(fs, "get_point_in_time_fundamentals", side_effect=_mock_fundamentals), \
+     patch.object(tg_bot, "send_message", side_effect=_fake_send_message):
+
+    sent_to_telegram.clear()
+    r = client.post("/monthly-screen", json={"chat_id": "chat_success", "pool_size": 5})
+    check("POST /monthly-screen returns 200 with status=accepted immediately",
+          r.status_code == 200 and r.json()["status"] == "accepted", r.text)
+    check("POST /monthly-screen response does NOT itself contain the weights "
+          "(delivered via Telegram, not the HTTP response -- see docstring on why)",
+          "weights" not in r.json(), r.json())
+
+    check("Background task actually ran (TestClient runs background tasks synchronously) "
+          "and sent exactly one Telegram message",
+          len(sent_to_telegram) == 1, sent_to_telegram)
+    result_text = sent_to_telegram[0]["text"]
+    check("Telegram result went to the correct chat_id", sent_to_telegram[0]["chat_id"] == "chat_success", sent_to_telegram)
+    check("Telegram message reports at least one symbol with a weight",
+          any(sym in result_text for sym in _MONTHLY_UNIVERSE_SYMBOLS), result_text)
+    check("Telegram message reports a cash percentage", "Cash:" in result_text, result_text)
+    check("Telegram message is well-formed Markdown (bold header pairs correctly)",
+          result_text.count("*") % 2 == 0, result_text)
+
+
+print("\n--- Abort path: too few universe symbols ---")
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", ""), \
+     patch.object(us, "build_live_universe", return_value=(["ONLYONE"], {"ONLYONE": "Banking"}, {"ONLYONE": 10.0})), \
+     patch.object(tg_bot, "send_message", side_effect=_fake_send_message):
+
+    sent_to_telegram.clear()
+    r = client.post("/monthly-screen", json={"chat_id": "chat_toofew"})
+    check("POST /monthly-screen still returns 200 even though the run will abort "
+          "(the abort happens in the background, not the HTTP response)",
+          r.status_code == 200, r.text)
+    check("Too-few-universe-symbols abort correctly notifies the chat instead of crashing silently",
+          len(sent_to_telegram) == 1 and "only 1" in sent_to_telegram[0]["text"], sent_to_telegram)
+    check("Abort message explicitly names the minimum holdings requirement",
+          str(ps.MIN_HOLDINGS) in sent_to_telegram[0]["text"], sent_to_telegram)
+
+
+print("\n--- Abort path: too few ELIGIBLE symbols after screening (universe was big enough, screening wasn't) ---")
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", ""), \
+     patch.object(us, "build_live_universe", side_effect=_mock_build_live_universe), \
+     patch.object(nps, "get_price_series_for_symbols", return_value=({}, list(_MONTHLY_UNIVERSE_SYMBOLS))), \
+     patch.object(tg_bot, "send_message", side_effect=_fake_send_message):
+    # No symbol has usable price history (empty series dict) -> screen_universe
+    # marks every one ineligible -> ranked list is empty -> second abort branch.
+
+    sent_to_telegram.clear()
+    r = client.post("/monthly-screen", json={"chat_id": "chat_noeligible"})
+    check("POST /monthly-screen returns 200 for the post-screening abort path too", r.status_code == 200, r.text)
+    check("Zero-eligible-after-screening abort correctly notifies the chat",
+          len(sent_to_telegram) == 1 and "eligible symbols after screening" in sent_to_telegram[0]["text"],
+          sent_to_telegram)
+
+
+print("\n--- Skipped symbols (no live price history) are reported, not silently dropped ---")
+
+
+def _mock_partial_price_series(symbols, days=130, max_requests=100):
+    import pandas as pd
+    full_series, _ = _mock_get_price_series_for_symbols(symbols, days=days, max_requests=max_requests)
+    partial = {k: v for k, v in full_series.items() if k != "SEPLAT"}
+    return partial, ["SEPLAT"]
+
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", ""), \
+     patch.object(us, "build_live_universe", side_effect=_mock_build_live_universe), \
+     patch.object(nps, "get_price_series_for_symbols", side_effect=_mock_partial_price_series), \
+     patch.object(fs, "get_point_in_time_fundamentals", side_effect=_mock_fundamentals), \
+     patch.object(tg_bot, "send_message", side_effect=_fake_send_message):
+
+    sent_to_telegram.clear()
+    r = client.post("/monthly-screen", json={"chat_id": "chat_skipped", "pool_size": 5})
+    check("POST /monthly-screen with one skipped symbol still succeeds", r.status_code == 200, r.text)
+    check("Skipped symbol (no usable price history) is reported in the Telegram message",
+          "SEPLAT" in sent_to_telegram[0]["text"] and "No usable price history" in sent_to_telegram[0]["text"],
+          sent_to_telegram)
+
+
+print("\n--- Exception during the run is reported via Telegram, not swallowed silently ---")
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", ""), \
+     patch.object(us, "build_live_universe", side_effect=RuntimeError("NGX Pulse is down")), \
+     patch.object(tg_bot, "send_message", side_effect=_fake_send_message):
+
+    sent_to_telegram.clear()
+    r = client.post("/monthly-screen", json={"chat_id": "chat_exception"})
+    check("POST /monthly-screen returns 200 even when the background run raises", r.status_code == 200, r.text)
+    check("Exception during the run is reported to the chat via Telegram, not lost silently",
+          len(sent_to_telegram) == 1 and "Monthly screen failed" in sent_to_telegram[0]["text"], sent_to_telegram)
+
+
+print("\n--- Exception messages containing markdown-special characters don't break the failure notification ---")
+
+with patch.object(main, "MONTHLY_SCREEN_SECRET", ""), \
+     patch.object(us, "build_live_universe", side_effect=RuntimeError("bad_symbol_list contains `NIDF`")), \
+     patch.object(tg_bot, "send_message", side_effect=_fake_send_message):
+
+    sent_to_telegram.clear()
+    r = client.post("/monthly-screen", json={"chat_id": "chat_exception_md"})
+    check("POST /monthly-screen returns 200 even for a markdown-hostile exception message", r.status_code == 200, r.text)
+    exc_reply = sent_to_telegram[0]["text"]
+    check("An exception message containing _ and ` is correctly Markdown-escaped in the notification, "
+          "not sent raw (which is exactly the class of bug that caused total silence in bot.py earlier)",
+          "bad\\_symbol\\_list" in exc_reply and "\\`NIDF\\`" in exc_reply, exc_reply)
 
 
 # =======================================================================
