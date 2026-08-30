@@ -46,7 +46,7 @@ import portfolio_service as ps
 import db
 import bot as tg_bot
 import ngx_pulse_service as nps
-import universe_service as us
+import monthly_screen_service as mss
 import requests
 
 app = FastAPI(
@@ -110,46 +110,8 @@ class FundamentalsOut(BaseModel):
     data_available: bool
 
 
-FUNDAMENTALS_CACHE_MAX_AGE_DAYS = 1  # refreshed daily; avoids re-scraping ~75 names per screen
-
-
-def _get_cached_or_live_fundamentals(
-    symbol: str, as_of_date: datetime, current_price: Optional[float] = None
-) -> fs.PointInTimeFundamentals:
-    """Drop-in replacement for fundamentals_service.get_point_in_time_fundamentals
-    that checks db.get_cached_fundamentals() first. On a cache hit, pe is
-    recomputed from the cached eps_used against the current current_price
-    (price is caller-supplied and can move within the cache's validity
-    window; eps_used/eps_period_ending are the stable, reporting-lag-gated
-    facts and are safe to reuse as-is). On a miss/stale entry, does the
-    live scrape and writes the result back via db.cache_fundamentals()."""
-    as_of_d = as_of_date.date() if isinstance(as_of_date, datetime) else as_of_date
-    cached = db.get_cached_fundamentals(symbol, as_of_d, max_age_days=FUNDAMENTALS_CACHE_MAX_AGE_DAYS)
-    if cached is not None:
-        eps_used = float(cached["eps_used"]) if cached["eps_used"] is not None else None
-        pe = float(cached["pe"]) if cached["pe"] is not None else None
-        if current_price is not None and eps_used is not None and eps_used > 0:
-            pe = current_price / eps_used
-        return fs.PointInTimeFundamentals(
-            symbol=symbol,
-            as_of_date=as_of_date,
-            roe=float(cached["roe"]) if cached["roe"] is not None else None,
-            pe=pe,
-            eps_used=eps_used,
-            eps_period_ending=cached["eps_period_ending"],
-            data_available=True,
-        )
-
-    result = fs.get_point_in_time_fundamentals(symbol, as_of_date, current_price=current_price)
-    if result.data_available:
-        eps_period_ending = result.eps_period_ending
-        if isinstance(eps_period_ending, datetime):
-            eps_period_ending = eps_period_ending.date()
-        db.cache_fundamentals(
-            symbol, as_of_d, roe=result.roe, pe=result.pe,
-            eps_used=result.eps_used, eps_period_ending=eps_period_ending,
-        )
-    return result
+FUNDAMENTALS_CACHE_MAX_AGE_DAYS = mss.FUNDAMENTALS_CACHE_MAX_AGE_DAYS  # re-exported for backward compat
+_get_cached_or_live_fundamentals = mss.get_cached_or_live_fundamentals  # single shared implementation
 
 
 def _run_screen(payload: UniverseInput) -> List[ss.ScoredStock]:
@@ -169,13 +131,7 @@ def _run_screen(payload: UniverseInput) -> List[ss.ScoredStock]:
     )
 
 
-def _ranked_eligible_symbols(scored: List[ss.ScoredStock]) -> List[str]:
-    """The one correct way to turn a screen_universe() result into the
-    ranked_symbols list portfolio_service.build_initial_portfolio expects:
-    filter to eligible stocks (which are already sorted best-to-worst),
-    discard ineligible ones entirely rather than letting them lead the
-    list. See module docstring for why this filter is required."""
-    return [s.symbol for s in scored if s.eligible]
+_ranked_eligible_symbols = mss.ranked_eligible_symbols  # single shared implementation, see monthly_screen_service.py
 
 
 def _scored_stock_to_out(s: ss.ScoredStock) -> ScoredStockOut:
@@ -789,81 +745,6 @@ class MonthlyScreenRequest(BaseModel):
     )
 
 
-def _fmt_pct(x: float) -> str:
-    return f"{x * 100:.2f}%"
-
-
-def _run_monthly_screen_and_notify(chat_id: str, pool_size: int, cash_buffer: float,
-                                     lookback_days: int, max_ngx_pulse_requests: int):
-    """The actual work, run via BackgroundTasks so the HTTP request/response
-    itself returns immediately -- screening a ~78-name universe means one
-    fundamentals scrape per eligible symbol (stockanalysis.com, ~4 seconds
-    each including the polite delay -- see fundamentals_service.py), which
-    can comfortably take several minutes end to end. That's longer than
-    Render's own reverse-proxy is willing to hold a request open for, so
-    the result is delivered via Telegram directly rather than in the HTTP
-    response -- this function's only real caller-visible output is the
-    Telegram message(s) it sends."""
-    try:
-        symbols, sector_by_symbol, current_price_by_symbol = us.build_live_universe()
-        if len(symbols) < ps.MIN_HOLDINGS:
-            tg_bot.send_message(
-                chat_id,
-                f"Monthly screen: only {len(symbols)} symbols passed the live universe filter "
-                f"(need at least {ps.MIN_HOLDINGS}). Aborting -- check NGX Pulse data quality.",
-            )
-            return
-
-        price_series_by_symbol, skipped = nps.get_price_series_for_symbols(
-            symbols, days=lookback_days, max_requests=max_ngx_pulse_requests,
-        )
-
-        as_of_dt = datetime.utcnow()
-        scored = ss.screen_universe(
-            price_series_by_symbol=price_series_by_symbol,
-            current_price_by_symbol=current_price_by_symbol,
-            sector_by_symbol=sector_by_symbol,
-            as_of_date=as_of_dt,
-            excluded_symbols=set(),  # universe_service already excludes NIDF/NREIT
-            fundamentals_fetcher=_get_cached_or_live_fundamentals,
-        )
-        ranked = _ranked_eligible_symbols(scored)
-
-        if len(ranked) < ps.MIN_HOLDINGS:
-            tg_bot.send_message(
-                chat_id,
-                f"Monthly screen: only {len(ranked)} eligible symbols after screening "
-                f"(need at least {ps.MIN_HOLDINGS}). Aborting.",
-            )
-            return
-
-        weights, cash_pct = ps.build_initial_portfolio(
-            ranked, sector_by_symbol, pool_size=pool_size, cash_buffer=cash_buffer,
-        )
-
-        lines = [
-            f"{tg_bot._escape_md(sym)}: {_fmt_pct(w)}"
-            for sym, w in weights.sort_values(ascending=False).items()
-        ]
-        msg = (
-            f"*Monthly screen results -- {as_of_dt:%Y-%m-%d}*\n\n"
-            + "\n".join(lines)
-            + f"\n\nCash: {_fmt_pct(cash_pct)}"
-            + f"\n\n{len(price_series_by_symbol)} of {len(symbols)} universe symbols had usable "
-              f"price history; {len(ranked)} were eligible after screening."
-        )
-        if skipped:
-            msg += f"\n\nNo usable price history (excluded): {', '.join(tg_bot._escape_md(s) for s in skipped)}"
-        tg_bot.send_message(chat_id, msg)
-
-    except Exception as e:  # noqa: BLE001 -- this already runs in the background;
-        # nothing else observes an exception here except the person via Telegram.
-        try:
-            tg_bot.send_message(chat_id, f"Monthly screen failed: {tg_bot._escape_md(e)}")
-        except Exception as notify_err:
-            print(f"monthly screen failed AND could not notify chat {chat_id}: {e} / {notify_err}")
-
-
 @app.post("/monthly-screen")
 def monthly_screen(
     payload: MonthlyScreenRequest,
@@ -872,18 +753,24 @@ def monthly_screen(
 ):
     """Kicks off a live universe screen + portfolio construction in the
     background and returns immediately; results arrive via Telegram, not
-    in this response (see _run_monthly_screen_and_notify's docstring for
-    why). Requires X-Monthly-Screen-Secret to match MONTHLY_SCREEN_SECRET
-    when that env var is configured -- same pattern as the Telegram
-    webhook secret, since this endpoint triggers real NGX Pulse quota
-    usage and several minutes of scraping and shouldn't be triggerable
-    by anyone who finds the URL."""
+    in this response (see monthly_screen_service.run_monthly_screen_and_notify's
+    docstring for why). Requires X-Monthly-Screen-Secret to match
+    MONTHLY_SCREEN_SECRET when that env var is configured -- same pattern
+    as the Telegram webhook secret, since this endpoint triggers real
+    NGX Pulse quota usage and several minutes of scraping and shouldn't
+    be triggerable by anyone who finds the URL.
+
+    The actual work lives in monthly_screen_service.py, shared with
+    bot.py's /monthly_screen Telegram command -- this endpoint and that
+    command are two different TRIGGERS for the exact same implementation,
+    not two implementations."""
     if MONTHLY_SCREEN_SECRET and x_monthly_screen_secret != MONTHLY_SCREEN_SECRET:
         raise HTTPException(status_code=401, detail="invalid monthly screen secret")
     background_tasks.add_task(
-        _run_monthly_screen_and_notify,
+        mss.run_monthly_screen_and_notify,
         payload.chat_id, payload.pool_size, payload.cash_buffer,
         payload.lookback_days, payload.max_ngx_pulse_requests,
+        tg_bot.send_message, tg_bot._escape_md,
     )
     return {
         "status": "accepted",
