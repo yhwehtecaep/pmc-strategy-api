@@ -201,6 +201,44 @@ def safety_pass(weights: pd.Series, sectors: dict, cash: float,
     return new_weights, cash, trim_total, redeploy_total
 
 
+def identify_diversification_additions(current_symbols, ranked_pool: list,
+                                          floor: int = DIVERSIFICATION_FLOOR) -> list:
+    """The diversification-floor logic described in the strategy
+    documentation's walk-forward backtest section (Section 10: "Adding a
+    practical diversification floor (replenish below 10 holdings, distinct
+    from the hard compliance minimum of 5)") but never previously
+    implemented anywhere in this codebase -- DIVERSIFICATION_FLOOR was
+    declared above but unused until now.
+
+    If len(current_symbols) is already >= floor, returns [] -- no action
+    needed, matching the documented policy that new names are added ONLY
+    when holdings have shrunk below the floor, never as a routine "top up
+    to more names" action every month regardless of current count.
+
+    Otherwise, returns up to (floor - len(current_symbols)) symbols from
+    ranked_pool, in rank order (best first), EXCLUDING anything already
+    held -- these are recommendations for NEW positions to open, not a
+    target-weight computation (the caller decides how to size them,
+    typically by re-running build_initial_portfolio with these names
+    folded into the held set, or by simple equal-split of whatever cash
+    is being deployed -- this function only answers "which names", not
+    "how much of each").
+
+    current_symbols: iterable of symbols currently held (order doesn't
+    matter -- converted to a set internally).
+    ranked_pool: symbols already sorted best-to-worst by composite score
+    (e.g. from a fresh screen_universe() + eligibility filter), NOT
+    already limited to a construction pool_size -- pass the fuller ranked
+    list so there's actually room to find replacements beyond whatever
+    pool_size names were used for weighting."""
+    held = set(current_symbols)
+    needed = floor - len(held)
+    if needed <= 0:
+        return []
+    candidates = [s for s in ranked_pool if s not in held]
+    return candidates[:needed]
+
+
 def check_drift(actual_weights: pd.Series, fresh_target_weights: pd.Series,
                  drift_threshold: float = DRIFT_THRESHOLD) -> pd.DataFrame:
     """Compares actual current weights to freshly-computed targets (for
