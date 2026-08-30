@@ -120,7 +120,7 @@ with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_m
     r = client.post("/telegram/webhook", json=_telegram_message_update("chat_help", "/help"))
     check("webhook /help returns 200", r.status_code == 200, r.text)
     check("webhook /help sent exactly one message", len(sent_messages) == 1, sent_messages)
-    check("webhook /help mentions /new_portfolio", "/new_portfolio" in sent_messages[-1]["text"], sent_messages)
+    check("webhook /help mentions /new_portfolio", "/new\\_portfolio" in sent_messages[-1]["text"], sent_messages)
 
     sent_messages.clear()
     r = client.post("/telegram/webhook", json=_telegram_message_update("chat_help", "just chatting, not a command"))
@@ -247,7 +247,7 @@ with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_m
         chat, '/new_portfolio "Test" Ticker NGN not_a_number 2026-01-01'
     ))
     check("malformed /new_portfolio (bad capital) returns a specific error",
-          "initial_capital must be a number" in sent_messages[-1]["text"], sent_messages)
+          "initial\\_capital must be a number" in sent_messages[-1]["text"], sent_messages)
 
     sent_messages.clear()
     client.post("/telegram/webhook", json=_telegram_message_update(
@@ -389,7 +389,7 @@ with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_m
               mock_nps.call_count == 1, mock_nps.call_count)
     reply = sent_messages[-1]["text"]
     check("/log_trade buy confirms with default reason 'monthly_rebalance'",
-          "monthly_rebalance" in reply, reply)
+          "monthly\\_rebalance" in reply, reply)
     check("/log_trade buy shows the resulting position", "100.00" in reply, reply)
 
     holding = next(h for h in db.get_holdings(pid_t) if h["symbol"] == "GTCO")
@@ -423,7 +423,7 @@ with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_m
         chat, "/log_trade sell GTCO 50 62.00 100.28 hard_breach"
     ))
     check("/log_trade with explicit reason overrides the default",
-          "hard_breach" in sent_messages[-1]["text"], sent_messages)
+          "hard\\_breach" in sent_messages[-1]["text"], sent_messages)
 
     # Oversell -- rejected, not a crash, holdings unchanged
     holding_before_oversell = next(h for h in db.get_holdings(pid_t) if h["symbol"] == "GTCO")
@@ -583,6 +583,164 @@ with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_m
           "fully closed" in last_reply.lower(), last_reply)
     check("/undo_trade down to zero shares: no ARADEL holding remains in DB",
           all(h["symbol"] != "ARADEL" for h in db.get_holdings(pid_u)), db.get_holdings(pid_u))
+
+
+# =======================================================================
+print("\n=== SECTION 13: Markdown-safety -- the actual live-production bug ===")
+# =======================================================================
+# Telegram's legacy Markdown parse mode treats a lone, unpaired _ * ` [ as
+# a broken formatting entity and returns 400, which previously caused
+# TOTAL SILENCE from the bot (e.g. /start itself failed, since its own
+# static text says "/new_portfolio"). This section directly tests the fix
+# (_escape_md, applied throughout) and the safety-net fallback.
+
+print("\n--- _escape_md unit behavior ---")
+check("_escape_md escapes a lone underscore", bot._escape_md("new_portfolio") == "new\\_portfolio",
+      bot._escape_md("new_portfolio"))
+check("_escape_md escapes asterisk, backtick, and open-bracket",
+      bot._escape_md("a*b`c[d") == "a\\*b\\`c\\[d", bot._escape_md("a*b`c[d"))
+check("_escape_md escapes a literal backslash FIRST (so it doesn't double-escape its own output)",
+      bot._escape_md("a\\_b") == "a\\\\\\_b", bot._escape_md("a\\_b"))
+check("_escape_md handles None safely (returns empty string, not a crash)", bot._escape_md(None) == "", bot._escape_md(None))
+check("_escape_md handles non-string input via str()", bot._escape_md(404) == "404", bot._escape_md(404))
+
+
+def _no_unescaped_markdown_specials(text: str) -> bool:
+    """Test helper: True if `text` forms VALID Telegram legacy-Markdown
+    (won't 400). bot.py intentionally uses REAL unescaped * (bold) and `
+    (code span) for formatting -- so the correct check isn't "zero special
+    characters", it's "every unescaped special character is part of a
+    correctly paired entity": unescaped _, *, and ` counts must each be
+    even (open/close pairs), and unescaped [ must not appear at all since
+    nothing in bot.py ever intends a real markdown link (an unmatched [
+    is exactly the kind of thing _escape_md exists to prevent)."""
+    counts = {"_": 0, "*": 0, "`": 0}
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        escaped = i > 0 and text[i - 1] == "\\"
+        if ch in counts and not escaped:
+            counts[ch] += 1
+        if ch == "[" and not escaped:
+            return False
+        i += 1
+    return all(c % 2 == 0 for c in counts.values())
+
+
+print("\n--- Every static reply that broke live production is now safe ---")
+
+with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_message", side_effect=_fake_send_message):
+    chat = "chat_mdsafety_1"
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/start"))
+    check("/start's reply (THE actual reported production failure) is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/help"))
+    check("/help's reply is Markdown-safe", _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/status"))
+    check("/status (no active portfolio) reply is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/new_portfolio bad args"))
+    check("malformed /new_portfolio usage message is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, '/new_portfolio "Test" Ticker NGN notanumber 2026-01-01'))
+    check("malformed /new_portfolio (bad capital) error message is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/log_trade bad args"))
+    check("malformed /log_trade usage message is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/undo_trade"))
+    check("/undo_trade usage message is Markdown-safe", _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/ack"))
+    check("/ack usage message is Markdown-safe", _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+
+print("\n--- Dynamic/user-supplied values with markdown-special characters don't break replies ---")
+
+with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_message", side_effect=_fake_send_message):
+    chat = "chat_mdsafety_2"
+
+    # A portfolio name containing every markdown-special character at once
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(
+        chat, '/new_portfolio "My_Fund*Test`One[Two]" Ticker NGN 1000000 2026-01-01'
+    ))
+    check("/new_portfolio with a special-character name is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+    check("/new_portfolio confirmation still contains the (escaped) actual name",
+          "My" in sent_messages[-1]["text"] and "Fund" in sent_messages[-1]["text"], sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/status"))
+    check("/status for a special-character-named portfolio is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    # A symbol argument with an underscore in it (unusual, but nothing validates
+    # against it -- must not be able to break the reply either way)
+    sent_messages.clear()
+    with patch.object(bot.nps, "get_current_prices_and_sectors", return_value=({}, {})):
+        client.post("/telegram/webhook", json=_telegram_message_update(chat, "/log_trade buy WEIRD_SYM 10 5.00 auto"))
+    check("/log_trade with an underscored symbol name is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/holdings"))
+    check("/holdings for a portfolio holding an underscored symbol is Markdown-safe",
+          _no_unescaped_markdown_specials(sent_messages[-1]["text"]), sent_messages[-1]["text"])
+
+
+print("\n--- send_message plain-text fallback: a 400 never results in total silence ---")
+
+with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""):
+    fallback_calls = []
+
+    def _fake_send_message_400_then_ok(chat_id, text, parse_mode="Markdown"):
+        fallback_calls.append({"chat_id": chat_id, "text": text, "parse_mode": parse_mode})
+        if parse_mode == "Markdown":
+            return _FakeResponse(400, '{"ok":false,"error_code":400,"description":"Bad Request: can\'t parse entities"}')
+        return _FakeResponse(200, '{"ok":true}')
+
+    fallback_calls.clear()
+    with patch.object(bot, "send_message", side_effect=_fake_send_message_400_then_ok):
+        r = client.post("/telegram/webhook", json=_telegram_message_update("chat_fallback", "/start"))
+    check("webhook still returns 200 even when the first sendMessage attempt 400s", r.status_code == 200, r.text)
+    check("on a 400, exactly one retry is made", len(fallback_calls) == 2, fallback_calls)
+    check("the retry uses parse_mode=None (plain text), not Markdown again",
+          fallback_calls[0]["parse_mode"] == "Markdown" and fallback_calls[1]["parse_mode"] is None, fallback_calls)
+    check("the retry sends the SAME text content as the original attempt",
+          fallback_calls[0]["text"] == fallback_calls[1]["text"], fallback_calls)
+
+    # send_message itself: parse_mode=None must omit the key, not send JSON null
+    # (Telegram's own default for an absent parse_mode is plain text; sending
+    # null explicitly is untested/undocumented behavior worth avoiding).
+    with patch.object(bot.requests, "post") as mock_post:
+        mock_post.return_value = _FakeResponse(200, '{"ok":true}')
+        bot.send_message("123", "hello", parse_mode=None)
+        sent_payload = mock_post.call_args.kwargs["json"]
+        check("send_message(parse_mode=None) omits the parse_mode key entirely",
+              "parse_mode" not in sent_payload, sent_payload)
+
+    with patch.object(bot.requests, "post") as mock_post2:
+        mock_post2.return_value = _FakeResponse(200, '{"ok":true}')
+        bot.send_message("123", "hello")  # default
+        sent_payload2 = mock_post2.call_args.kwargs["json"]
+        check("send_message with the default parse_mode still sends parse_mode=Markdown",
+              sent_payload2.get("parse_mode") == "Markdown", sent_payload2)
 
 
 # =======================================================================
