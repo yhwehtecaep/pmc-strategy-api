@@ -13,8 +13,12 @@ portfolio_service.py behind four stateless endpoints:
 Since then, also wired in: db.py (persistent portfolios/holdings/trades/
 signals -- see the Portfolios/Holdings/Trades/Signals sections below, and
 /rebalance-check's optional portfolio_id path), bot.py (POST
-/telegram/webhook), and ngx_pulse_service.py (live current-price fetch for
-/rebalance-check's stateful path when current_price_by_symbol is omitted).
+/telegram/webhook), ngx_pulse_service.py (live current-price fetch for
+/rebalance-check's stateful path when current_price_by_symbol is omitted),
+and universe_service.py (POST /monthly-screen -- builds the live
+investable universe, screens it, constructs a fresh portfolio, and sends
+the result via Telegram; designed to be triggered automatically by a
+scheduled job, e.g. GitHub Actions, rather than run by hand each month).
 This module docstring covers only the original four; search each section
 header below for the rest.
 
@@ -30,9 +34,10 @@ screen_universe() directly must do the same filter -- see _ranked_eligible_symbo
 
 from datetime import datetime, date
 from typing import Dict, List, Optional
+import os
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Request, Header, BackgroundTasks
 from pydantic import BaseModel, Field
 
 import fundamentals_service as fs
@@ -41,6 +46,7 @@ import portfolio_service as ps
 import db
 import bot as tg_bot
 import ngx_pulse_service as nps
+import universe_service as us
 import requests
 
 app = FastAPI(
@@ -750,3 +756,136 @@ async def telegram_webhook(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------
+# Monthly screen (automated end-of-month trigger, e.g. via a scheduled
+# GitHub Actions workflow -- see the deployment notes for the workflow
+# file). Builds the live investable universe from NGX Pulse
+# (universe_service.py), screens it (screening_service.py), constructs a
+# fresh compliant portfolio (portfolio_service.py), and sends the
+# resulting target weights to the given Telegram chat -- it does NOT
+# execute trades or touch any stored portfolio/holdings. Per project
+# workflow, the person reviews the weights, executes the real trades on
+# Ticker manually, and logs them via the bot's /log_trade -- this endpoint
+# only replaces the "run the screen" step, not the "decide and trade" step.
+# ---------------------------------------------------------------------
+
+MONTHLY_SCREEN_SECRET = os.environ.get("MONTHLY_SCREEN_SECRET", "")
+
+
+class MonthlyScreenRequest(BaseModel):
+    chat_id: str = Field(..., description="Telegram chat id to send the resulting target weights to.")
+    pool_size: int = Field(default=15, description="Top-N eligible stocks considered for the portfolio.")
+    cash_buffer: float = Field(default=ps.CASH_BUFFER)
+    lookback_days: int = Field(default=nps.DEFAULT_LOOKBACK_DAYS)
+    max_ngx_pulse_requests: int = Field(
+        default=90, description="Budget for the price-history fetch loop (one request per "
+                                 "candidate symbol). Left under NGX Pulse's 100/day cap on "
+                                 "purpose -- this endpoint's own universe-snapshot call and "
+                                 "any same-day /value checks from the bot also draw on the "
+                                 "same real daily quota, which ngx_pulse_service.py tracks "
+                                 "only per-call, not across the whole day (see its docstring)."
+    )
+
+
+def _fmt_pct(x: float) -> str:
+    return f"{x * 100:.2f}%"
+
+
+def _run_monthly_screen_and_notify(chat_id: str, pool_size: int, cash_buffer: float,
+                                     lookback_days: int, max_ngx_pulse_requests: int):
+    """The actual work, run via BackgroundTasks so the HTTP request/response
+    itself returns immediately -- screening a ~78-name universe means one
+    fundamentals scrape per eligible symbol (stockanalysis.com, ~4 seconds
+    each including the polite delay -- see fundamentals_service.py), which
+    can comfortably take several minutes end to end. That's longer than
+    Render's own reverse-proxy is willing to hold a request open for, so
+    the result is delivered via Telegram directly rather than in the HTTP
+    response -- this function's only real caller-visible output is the
+    Telegram message(s) it sends."""
+    try:
+        symbols, sector_by_symbol, current_price_by_symbol = us.build_live_universe()
+        if len(symbols) < ps.MIN_HOLDINGS:
+            tg_bot.send_message(
+                chat_id,
+                f"Monthly screen: only {len(symbols)} symbols passed the live universe filter "
+                f"(need at least {ps.MIN_HOLDINGS}). Aborting -- check NGX Pulse data quality.",
+            )
+            return
+
+        price_series_by_symbol, skipped = nps.get_price_series_for_symbols(
+            symbols, days=lookback_days, max_requests=max_ngx_pulse_requests,
+        )
+
+        as_of_dt = datetime.utcnow()
+        scored = ss.screen_universe(
+            price_series_by_symbol=price_series_by_symbol,
+            current_price_by_symbol=current_price_by_symbol,
+            sector_by_symbol=sector_by_symbol,
+            as_of_date=as_of_dt,
+            excluded_symbols=set(),  # universe_service already excludes NIDF/NREIT
+            fundamentals_fetcher=_get_cached_or_live_fundamentals,
+        )
+        ranked = _ranked_eligible_symbols(scored)
+
+        if len(ranked) < ps.MIN_HOLDINGS:
+            tg_bot.send_message(
+                chat_id,
+                f"Monthly screen: only {len(ranked)} eligible symbols after screening "
+                f"(need at least {ps.MIN_HOLDINGS}). Aborting.",
+            )
+            return
+
+        weights, cash_pct = ps.build_initial_portfolio(
+            ranked, sector_by_symbol, pool_size=pool_size, cash_buffer=cash_buffer,
+        )
+
+        lines = [
+            f"{tg_bot._escape_md(sym)}: {_fmt_pct(w)}"
+            for sym, w in weights.sort_values(ascending=False).items()
+        ]
+        msg = (
+            f"*Monthly screen results -- {as_of_dt:%Y-%m-%d}*\n\n"
+            + "\n".join(lines)
+            + f"\n\nCash: {_fmt_pct(cash_pct)}"
+            + f"\n\n{len(price_series_by_symbol)} of {len(symbols)} universe symbols had usable "
+              f"price history; {len(ranked)} were eligible after screening."
+        )
+        if skipped:
+            msg += f"\n\nNo usable price history (excluded): {', '.join(tg_bot._escape_md(s) for s in skipped)}"
+        tg_bot.send_message(chat_id, msg)
+
+    except Exception as e:  # noqa: BLE001 -- this already runs in the background;
+        # nothing else observes an exception here except the person via Telegram.
+        try:
+            tg_bot.send_message(chat_id, f"Monthly screen failed: {tg_bot._escape_md(e)}")
+        except Exception as notify_err:
+            print(f"monthly screen failed AND could not notify chat {chat_id}: {e} / {notify_err}")
+
+
+@app.post("/monthly-screen")
+def monthly_screen(
+    payload: MonthlyScreenRequest,
+    background_tasks: BackgroundTasks,
+    x_monthly_screen_secret: Optional[str] = Header(default=None),
+):
+    """Kicks off a live universe screen + portfolio construction in the
+    background and returns immediately; results arrive via Telegram, not
+    in this response (see _run_monthly_screen_and_notify's docstring for
+    why). Requires X-Monthly-Screen-Secret to match MONTHLY_SCREEN_SECRET
+    when that env var is configured -- same pattern as the Telegram
+    webhook secret, since this endpoint triggers real NGX Pulse quota
+    usage and several minutes of scraping and shouldn't be triggerable
+    by anyone who finds the URL."""
+    if MONTHLY_SCREEN_SECRET and x_monthly_screen_secret != MONTHLY_SCREEN_SECRET:
+        raise HTTPException(status_code=401, detail="invalid monthly screen secret")
+    background_tasks.add_task(
+        _run_monthly_screen_and_notify,
+        payload.chat_id, payload.pool_size, payload.cash_buffer,
+        payload.lookback_days, payload.max_ngx_pulse_requests,
+    )
+    return {
+        "status": "accepted",
+        "detail": "Monthly screen started in the background; results will be sent via Telegram.",
+    }
