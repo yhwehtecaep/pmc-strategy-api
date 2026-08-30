@@ -69,13 +69,18 @@ def send_message(chat_id: str, text: str, parse_mode: str = "Markdown"):
     network call to api.telegram.org -- unreachable from this sandbox,
     mocked in test_bot.py. Raises RuntimeError if no token is configured
     rather than silently no-op-ing, so a misconfigured deployment fails
-    loudly instead of looking like a bug in the command logic."""
+    loudly instead of looking like a bug in the command logic.
+
+    parse_mode=None sends plain text (the parse_mode key is omitted from
+    the payload entirely, not sent as JSON null -- Telegram's own default
+    when parse_mode is absent). Used by handle_update's fallback below."""
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
     url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    return requests.post(
-        url, json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}, timeout=10
-    )
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return requests.post(url, json=payload, timeout=10)
 
 
 def verify_webhook_secret(header_value: Optional[str]) -> bool:
@@ -97,6 +102,28 @@ def verify_webhook_secret(header_value: Optional[str]) -> bool:
 # of any Telegram/network concerns.
 # ---------------------------------------------------------------------
 
+def _escape_md(value) -> str:
+    """Escapes Telegram legacy-Markdown's four special characters (_ * ` [)
+    with a backslash, per the Bot API's documented escaping rule for this
+    parse mode. REQUIRED on every piece of text that isn't intentionally
+    markdown syntax -- both literal command names in static text (e.g.
+    "/new_portfolio" has an unescaped underscore that Telegram's parser
+    reads as an unclosed italic marker) and any dynamic value interpolated
+    into a reply (portfolio name, symbol, sector, broker, or anything else
+    that ultimately comes from user input and could coincidentally contain
+    one of these characters). Skipping this on ANY interpolated value
+    means a single well-formed command with an oddly-named portfolio can
+    silently break that reply -- this was a real, live bug (Telegram
+    returned 400 "can't parse entities" on /start itself, whose static
+    text contains "/new_portfolio"), not a hypothetical one."""
+    if value is None:
+        return ""
+    s = str(value)
+    for ch in ("\\", "_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
 def _fmt_money(x) -> str:
     try:
         return f"{float(x):,.2f}"
@@ -106,10 +133,10 @@ def _fmt_money(x) -> str:
 
 def _fmt_portfolio(p: dict) -> str:
     return (
-        f"*{p['name']}*\n"
-        f"Status: {p['status']}\n"
-        f"Broker: {p['broker']}\n"
-        f"Currency: {p['currency']}\n"
+        f"*{_escape_md(p['name'])}*\n"
+        f"Status: {_escape_md(p['status'])}\n"
+        f"Broker: {_escape_md(p['broker'])}\n"
+        f"Currency: {_escape_md(p['currency'])}\n"
         f"Initial capital: {_fmt_money(p['initial_capital'])}\n"
         f"Inception: {p['inception_date']}\n"
         f"ID: `{p['id']}`"
@@ -120,7 +147,8 @@ def _fmt_holdings(holdings: list) -> str:
     if not holdings:
         return "No holdings."
     return "\n".join(
-        f"{h['symbol']}: {float(h['shares']):,.2f} sh @ {_fmt_money(h['avg_cost'])} ({h['sector'] or 'N/A'})"
+        f"{_escape_md(h['symbol'])}: {float(h['shares']):,.2f} sh @ {_fmt_money(h['avg_cost'])} "
+        f"({_escape_md(h['sector']) if h['sector'] else 'N/A'})"
         for h in holdings
     )
 
@@ -130,8 +158,8 @@ def _fmt_trades(trades: list, limit: int = 10) -> str:
         return "No trades."
     recent = trades[-limit:]
     return "\n".join(
-        f"[{t['id'][:8]}] {t['executed_at']:%Y-%m-%d} {t['side'].upper()} {float(t['shares']):,.2f} {t['symbol']} "
-        f"@ {_fmt_money(t['price'])} (fee {_fmt_money(t['fee'])})"
+        f"[{t['id'][:8]}] {t['executed_at']:%Y-%m-%d} {t['side'].upper()} {float(t['shares']):,.2f} "
+        f"{_escape_md(t['symbol'])} @ {_fmt_money(t['price'])} (fee {_fmt_money(t['fee'])})"
         for t in recent
     )
 
@@ -146,11 +174,12 @@ def _fmt_value_lines(holdings: list, current_prices: dict) -> tuple:
     missing = []
     for h in holdings:
         sym = h["symbol"]
+        sym_md = _escape_md(sym)
         shares = float(h["shares"])
         price = current_prices.get(sym)
         cost = float(h["avg_cost"]) if h["avg_cost"] is not None else None
         if price is None:
-            lines.append(f"{sym}: {shares:,.2f} sh -- live price unavailable")
+            lines.append(f"{sym_md}: {shares:,.2f} sh -- live price unavailable")
             missing.append(sym)
             continue
         market_value = shares * price
@@ -160,7 +189,7 @@ def _fmt_value_lines(holdings: list, current_prices: dict) -> tuple:
             total_cost_basis += shares * cost
             pct = (price - cost) / cost * 100
             gain_str = f" ({pct:+.1f}%)"
-        lines.append(f"{sym}: {shares:,.2f} sh @ {_fmt_money(price)} = {_fmt_money(market_value)}{gain_str}")
+        lines.append(f"{sym_md}: {shares:,.2f} sh @ {_fmt_money(price)} = {_fmt_money(market_value)}{gain_str}")
     return lines, total_market_value, total_cost_basis, missing
 
 
@@ -168,8 +197,8 @@ def _fmt_signals(signals: list) -> str:
     if not signals:
         return "No unacknowledged signals."
     return "\n".join(
-        f"[{s['id'][:8]}] {s['signal_type']}" + (f" {s['symbol']}" if s['symbol'] else "")
-        + f" -- {s['detail']}"
+        f"[{s['id'][:8]}] {_escape_md(s['signal_type'])}" + (f" {_escape_md(s['symbol'])}" if s['symbol'] else "")
+        + f" -- {_escape_md(s['detail'])}"
         for s in signals
     )
 
@@ -178,35 +207,38 @@ def _fmt_signals(signals: list) -> str:
 # Command handlers: (chat_id: str, args: list[str]) -> reply text
 # ---------------------------------------------------------------------
 
+NO_ACTIVE_PORTFOLIO_MSG = "No active portfolio for this chat. Use /new\\_portfolio to create one."
+
+
 def cmd_start(chat_id: str, args: list) -> str:
     db.register_chat(chat_id)
     return (
         "Welcome to the CFA PMC Strategy bot.\n"
-        "Use /new_portfolio to create your first portfolio, or /help to see all commands."
+        "Use /new\\_portfolio to create your first portfolio, or /help to see all commands."
     )
 
 
 def cmd_help(chat_id: str, args: list) -> str:
     return (
         "*Available commands*\n"
-        "/new_portfolio \"name\" broker currency initial_capital YYYY-MM-DD -- "
+        "/new\\_portfolio \"name\" broker currency initial\\_capital YYYY-MM-DD -- "
         "create a portfolio and make it active for this chat\n"
-        "/switch_portfolio \"name\" broker currency initial_capital YYYY-MM-DD -- "
+        "/switch\\_portfolio \"name\" broker currency initial\\_capital YYYY-MM-DD -- "
         "close the current active portfolio and start a new one\n"
-        "/close_portfolio [YYYY-MM-DD] -- close the active portfolio without starting "
+        "/close\\_portfolio \\[YYYY-MM-DD] -- close the active portfolio without starting "
         "a new one (defaults closed date to today)\n"
         "/status -- show the active portfolio's details\n"
         "/holdings -- show the active portfolio's current holdings\n"
         "/value -- live market value of current holdings, priced via NGX Pulse "
         "(equity holdings only -- cash isn't tracked here)\n"
-        "/log_trade buy|sell symbol shares price fee|auto [reason] -- record an "
-        "executed trade (defaults reason to \"monthly_rebalance\"); updates holdings "
+        "/log\\_trade buy|sell symbol shares price fee|auto \\[reason] -- record an "
+        "executed trade (defaults reason to \"monthly\\_rebalance\"); updates holdings "
         "automatically\n"
-        "/undo_trade trade_id -- undo a mistakenly logged trade (full id or its first "
+        "/undo\\_trade trade\\_id -- undo a mistakenly logged trade (full id or its first "
         "8 chars, shown in /trades) and correctly recompute the affected holding\n"
-        "/trades -- show the active portfolio's recent trade history (with ids for /undo_trade)\n"
+        "/trades -- show the active portfolio's recent trade history (with ids for /undo\\_trade)\n"
         "/signals -- show unacknowledged drift/breach signals\n"
-        "/ack signal_id -- acknowledge a signal (full id or its first 8 chars)\n"
+        "/ack signal\\_id -- acknowledge a signal (full id or its first 8 chars)\n"
         "/help -- show this message\n\n"
         "Not yet available here: screening, portfolio construction, and drift "
         "checks -- these need the full strategy compute layer (main.py's job, "
@@ -223,18 +255,18 @@ def _parse_new_portfolio_args(args: list):
     raises ValueError with a usage-appropriate message."""
     if len(args) != 5:
         raise ValueError(
-            'Usage: /new_portfolio "name" broker currency initial_capital YYYY-MM-DD\n'
-            'Example: /new_portfolio "CFA PMC 2026" Ticker NGN 10000000 2026-01-01'
+            'Usage: /new\\_portfolio "name" broker currency initial\\_capital YYYY-MM-DD\n'
+            'Example: /new\\_portfolio "CFA PMC 2026" Ticker NGN 10000000 2026-01-01'
         )
     name, broker, currency, capital_str, inception_str = args
     try:
         capital = float(capital_str)
     except ValueError:
-        raise ValueError(f"initial_capital must be a number, got {capital_str!r}")
+        raise ValueError(f"initial\\_capital must be a number, got {_escape_md(repr(capital_str))}")
     try:
         inception = datetime.strptime(inception_str, "%Y-%m-%d").date()
     except ValueError:
-        raise ValueError(f"inception date must be YYYY-MM-DD, got {inception_str!r}")
+        raise ValueError(f"inception date must be YYYY-MM-DD, got {_escape_md(repr(inception_str))}")
     return name, broker, currency, capital, inception
 
 
@@ -259,29 +291,29 @@ def cmd_switch_portfolio(chat_id: str, args: list) -> str:
 def cmd_status(chat_id: str, args: list) -> str:
     p = _require_active_portfolio(chat_id)
     if not p:
-        return "No active portfolio for this chat. Use /new_portfolio to create one."
+        return NO_ACTIVE_PORTFOLIO_MSG
     return _fmt_portfolio(p)
 
 
 def cmd_holdings(chat_id: str, args: list) -> str:
     p = _require_active_portfolio(chat_id)
     if not p:
-        return "No active portfolio for this chat. Use /new_portfolio to create one."
-    return f"*Holdings -- {p['name']}*\n\n{_fmt_holdings(db.get_holdings(p['id']))}"
+        return NO_ACTIVE_PORTFOLIO_MSG
+    return f"*Holdings -- {_escape_md(p['name'])}*\n\n{_fmt_holdings(db.get_holdings(p['id']))}"
 
 
 def cmd_trades(chat_id: str, args: list) -> str:
     p = _require_active_portfolio(chat_id)
     if not p:
-        return "No active portfolio for this chat. Use /new_portfolio to create one."
-    return f"*Recent trades -- {p['name']}* (last 10)\n\n{_fmt_trades(db.get_trades(p['id']))}"
+        return NO_ACTIVE_PORTFOLIO_MSG
+    return f"*Recent trades -- {_escape_md(p['name'])}* (last 10)\n\n{_fmt_trades(db.get_trades(p['id']))}"
 
 
 def cmd_signals(chat_id: str, args: list) -> str:
     p = _require_active_portfolio(chat_id)
     if not p:
-        return "No active portfolio for this chat. Use /new_portfolio to create one."
-    return f"*Unacknowledged signals -- {p['name']}*\n\n{_fmt_signals(db.get_unacknowledged_signals(p['id']))}"
+        return NO_ACTIVE_PORTFOLIO_MSG
+    return f"*Unacknowledged signals -- {_escape_md(p['name'])}*\n\n{_fmt_signals(db.get_unacknowledged_signals(p['id']))}"
 
 
 def cmd_value(chat_id: str, args: list) -> str:
@@ -293,21 +325,21 @@ def cmd_value(chat_id: str, args: list) -> str:
     never mistaken for total account value."""
     p = _require_active_portfolio(chat_id)
     if not p:
-        return "No active portfolio for this chat. Use /new_portfolio to create one."
+        return NO_ACTIVE_PORTFOLIO_MSG
 
     holdings_list = db.get_holdings(p["id"])
     if not holdings_list:
-        return f"*Live value -- {p['name']}*\n\nNo holdings. (Cash is not tracked by this bot.)"
+        return f"*Live value -- {_escape_md(p['name'])}*\n\nNo holdings. (Cash is not tracked by this bot.)"
 
     held_symbols = [h["symbol"] for h in holdings_list]
     try:
         current_prices, _sectors = nps.get_current_prices_and_sectors(symbols=held_symbols)
     except requests.RequestException as e:
-        return f"Could not fetch live prices from NGX Pulse: {e}"
+        return f"Could not fetch live prices from NGX Pulse: {_escape_md(e)}"
 
     lines, total_mv, total_cost, missing = _fmt_value_lines(holdings_list, current_prices)
 
-    body = f"*Live holdings value -- {p['name']}*\n\n" + "\n".join(lines)
+    body = f"*Live holdings value -- {_escape_md(p['name'])}*\n\n" + "\n".join(lines)
     body += f"\n\nTotal market value: {_fmt_money(total_mv)}"
     if total_cost > 0:
         gain = total_mv - total_cost
@@ -315,7 +347,7 @@ def cmd_value(chat_id: str, args: list) -> str:
         body += f"\nTotal cost basis: {_fmt_money(total_cost)}"
         body += f"\nUnrealized P/L: {_fmt_money(gain)} ({gain_pct:+.1f}%)"
     if missing:
-        body += f"\n\nNo live price available for: {', '.join(missing)} (excluded from total)."
+        body += f"\n\nNo live price available for: {', '.join(_escape_md(s) for s in missing)} (excluded from total)."
     body += "\n\n_Equity holdings only -- cash is not tracked by this bot._"
     return body
 
@@ -329,24 +361,24 @@ def _parse_log_trade_args(args: list):
     Usage: /log_trade side symbol shares price fee|auto [reason]"""
     if len(args) not in (5, 6):
         raise ValueError(
-            "Usage: /log_trade buy|sell symbol shares price fee|auto [reason]\n"
-            "Example: /log_trade buy GTCO 100 45.00 68.85\n"
-            "Example (auto-estimated fee): /log_trade sell MTNN 50 210.00 auto\n"
-            f'Reason defaults to "{DEFAULT_TRADE_REASON}" if omitted.'
+            "Usage: /log\\_trade buy|sell symbol shares price fee|auto \\[reason]\n"
+            "Example: /log\\_trade buy GTCO 100 45.00 68.85\n"
+            "Example (auto-estimated fee): /log\\_trade sell MTNN 50 210.00 auto\n"
+            f'Reason defaults to "{_escape_md(DEFAULT_TRADE_REASON)}" if omitted.'
         )
     side_raw, symbol, shares_str, price_str, fee_str = args[:5]
     side = side_raw.lower()
     if side not in ("buy", "sell"):
-        raise ValueError(f"side must be 'buy' or 'sell', got {side_raw!r}")
+        raise ValueError(f"side must be 'buy' or 'sell', got {_escape_md(repr(side_raw))}")
     symbol = symbol.upper()
     try:
         shares = float(shares_str)
     except ValueError:
-        raise ValueError(f"shares must be a number, got {shares_str!r}")
+        raise ValueError(f"shares must be a number, got {_escape_md(repr(shares_str))}")
     try:
         price = float(price_str)
     except ValueError:
-        raise ValueError(f"price must be a number, got {price_str!r}")
+        raise ValueError(f"price must be a number, got {_escape_md(repr(price_str))}")
     reason = args[5] if len(args) == 6 else DEFAULT_TRADE_REASON
     return side, symbol, shares, price, fee_str, reason
 
@@ -354,7 +386,7 @@ def _parse_log_trade_args(args: list):
 def cmd_log_trade(chat_id: str, args: list) -> str:
     p = _require_active_portfolio(chat_id)
     if not p:
-        return "No active portfolio for this chat. Use /new_portfolio to create one."
+        return NO_ACTIVE_PORTFOLIO_MSG
 
     try:
         side, symbol, shares, price, fee_str, reason = _parse_log_trade_args(args)
@@ -371,7 +403,7 @@ def cmd_log_trade(chat_id: str, args: list) -> str:
         try:
             fee = float(fee_str)
         except ValueError:
-            return f"fee must be a number or 'auto', got {fee_str!r}"
+            return f"fee must be a number or 'auto', got {_escape_md(repr(fee_str))}"
 
     existing = next((h for h in db.get_holdings(p["id"]) if h["symbol"] == symbol), None)
     sector = existing["sector"] if existing else None
@@ -384,14 +416,14 @@ def cmd_log_trade(chat_id: str, args: list) -> str:
             _prices, sectors = nps.get_current_prices_and_sectors(symbols=[symbol])
             sector = sectors.get(symbol)
             if sector is None:
-                sector_note = f"\n\n(Could not find {symbol} in the live NGX Pulse snapshot -- sector left unset.)"
+                sector_note = f"\n\n(Could not find {_escape_md(symbol)} in the live NGX Pulse snapshot -- sector left unset.)"
         except requests.RequestException as e:
-            sector_note = f"\n\n(Could not fetch sector from NGX Pulse: {e} -- sector left unset.)"
+            sector_note = f"\n\n(Could not fetch sector from NGX Pulse: {_escape_md(e)} -- sector left unset.)"
 
     try:
         db.log_trade(p["id"], symbol, side, shares, price, fee, reason=reason, sector=sector)
     except ValueError as e:
-        return f"Trade rejected: {e}"
+        return f"Trade rejected: {_escape_md(e)}"
 
     holding_after = next((h for h in db.get_holdings(p["id"]) if h["symbol"] == symbol), None)
     position_line = (
@@ -399,8 +431,8 @@ def cmd_log_trade(chat_id: str, args: list) -> str:
         if holding_after else "Position fully closed."
     )
     return (
-        f"Logged {side.upper()} {shares:,.2f} {symbol} @ {_fmt_money(price)} "
-        f"(fee {_fmt_money(fee)}, reason: {reason})\n{position_line}{sector_note}"
+        f"Logged {side.upper()} {shares:,.2f} {_escape_md(symbol)} @ {_fmt_money(price)} "
+        f"(fee {_fmt_money(fee)}, reason: {_escape_md(reason)})\n{position_line}{sector_note}"
     )
 
 
@@ -420,10 +452,10 @@ def cmd_close_portfolio(chat_id: str, args: list) -> str:
         try:
             closed_date = datetime.strptime(args[0], "%Y-%m-%d").date()
         except ValueError:
-            return f"closed date must be YYYY-MM-DD, got {args[0]!r}"
+            return f"closed date must be YYYY-MM-DD, got {_escape_md(repr(args[0]))}"
     db.close_portfolio(p["id"], closed_date=closed_date)
     db.set_active_portfolio(chat_id, None)
-    return f"Closed portfolio *{p['name']}*. Use /new_portfolio to start a new one."
+    return f"Closed portfolio *{_escape_md(p['name'])}*. Use /new\\_portfolio to start a new one."
 
 
 def cmd_undo_trade(chat_id: str, args: list) -> str:
@@ -431,7 +463,7 @@ def cmd_undo_trade(chat_id: str, args: list) -> str:
     docstring for why replay, not delta-reversal). Matches by full trade
     id or its first-8-char prefix shown in /trades, same UX as /ack."""
     if not args:
-        return "Usage: /undo_trade trade_id (full id or its first 8 chars, shown in /trades)"
+        return "Usage: /undo\\_trade trade\\_id (full id or its first 8 chars, shown in /trades)"
     p = _require_active_portfolio(chat_id)
     if not p:
         return "No active portfolio for this chat."
@@ -439,30 +471,30 @@ def cmd_undo_trade(chat_id: str, args: list) -> str:
     trades_list = db.get_trades(p["id"])
     match = next((t for t in trades_list if t["id"] == target or t["id"].startswith(target)), None)
     if not match:
-        return f"No trade matching '{target}' found in this portfolio's trade history."
+        return f"No trade matching '{_escape_md(target)}' found in this portfolio's trade history."
 
     try:
         resulting_holding = db.delete_trade(p["id"], match["id"])
     except ValueError as e:
-        return f"Could not undo trade: {e}"
+        return f"Could not undo trade: {_escape_md(e)}"
 
     summary = (
-        f"Undone: {match['side'].upper()} {float(match['shares']):,.2f} {match['symbol']} "
+        f"Undone: {match['side'].upper()} {float(match['shares']):,.2f} {_escape_md(match['symbol'])} "
         f"@ {_fmt_money(match['price'])} [{match['id'][:8]}]"
     )
     if resulting_holding:
         summary += (
-            f"\n{match['symbol']} position now: {float(resulting_holding['shares']):,.2f} sh "
+            f"\n{_escape_md(match['symbol'])} position now: {float(resulting_holding['shares']):,.2f} sh "
             f"@ avg cost {_fmt_money(resulting_holding['avg_cost'])}"
         )
     else:
-        summary += f"\n{match['symbol']} position is now fully closed."
+        summary += f"\n{_escape_md(match['symbol'])} position is now fully closed."
     return summary
 
 
 def cmd_ack(chat_id: str, args: list) -> str:
     if not args:
-        return "Usage: /ack signal_id"
+        return "Usage: /ack signal\\_id"
     p = _require_active_portfolio(chat_id)
     if not p:
         return "No active portfolio for this chat."
@@ -470,9 +502,9 @@ def cmd_ack(chat_id: str, args: list) -> str:
     signals = db.get_unacknowledged_signals(p["id"])
     match = next((s for s in signals if s["id"] == target or s["id"].startswith(target)), None)
     if not match:
-        return f"No unacknowledged signal matching '{target}' found."
+        return f"No unacknowledged signal matching '{_escape_md(target)}' found."
     db.acknowledge_signal(match["id"])
-    return f"Acknowledged signal [{match['id'][:8]}] {match['signal_type']}."
+    return f"Acknowledged signal [{match['id'][:8]}] {_escape_md(match['signal_type'])}."
 
 
 COMMANDS = {
@@ -528,12 +560,12 @@ def handle_update(update: dict) -> Optional[dict]:
     command, args = parse_command(text)
     handler = COMMANDS.get(command)
     if handler is None:
-        reply = f"Unknown command: {command}. Send /help for a list of commands."
+        reply = f"Unknown command: {_escape_md(command)}. Send /help for a list of commands."
     else:
         try:
             reply = handler(chat_id, args)
         except Exception as e:  # noqa: BLE001 -- a webhook must never 500 back to Telegram
-            reply = f"Something went wrong processing that command: {e}"
+            reply = f"Something went wrong processing that command: {_escape_md(e)}"
 
     try:
         resp = send_message(chat_id, reply)
@@ -545,6 +577,25 @@ def handle_update(update: dict) -> Optional[dict]:
             # the update, not delivery of the reply), but nothing would ever
             # show up in logs. Print goes to Render's log stream.
             print(f"telegram sendMessage failed ({resp.status_code}) for chat {chat_id}: {resp.text[:300]}")
+            if resp.status_code == 400:
+                # SAFETY NET: a 400 here almost always means Telegram's Markdown
+                # entity parser choked on something in `reply` (this exact bug
+                # class took real debugging effort to trace once -- an unescaped
+                # underscore in a command name like /new_portfolio silently
+                # broke EVERY reply mentioning it). _escape_md is applied
+                # throughout this file specifically to prevent that, but rather
+                # than trust that coverage is now and forever complete, retry
+                # once as plain text so the user gets SOME reply instead of
+                # total silence if a future edge case slips through un-escaped.
+                try:
+                    fallback_resp = send_message(chat_id, reply, parse_mode=None)
+                    if fallback_resp is not None and fallback_resp.status_code >= 300:
+                        print(
+                            f"telegram sendMessage plain-text fallback ALSO failed "
+                            f"({fallback_resp.status_code}) for chat {chat_id}: {fallback_resp.text[:300]}"
+                        )
+                except Exception as e:  # noqa: BLE001 -- this is already the fallback path
+                    print(f"telegram sendMessage plain-text fallback raised for chat {chat_id}: {e}")
     except Exception as e:  # noqa: BLE001 -- network/config errors must not 500 the webhook either
         print(f"telegram sendMessage raised for chat {chat_id}: {e}")
 
