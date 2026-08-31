@@ -246,6 +246,10 @@ def cmd_help(chat_id: str, args: list) -> str:
         "close the current active portfolio and start a new one\n"
         "/close\\_portfolio \\[YYYY-MM-DD] -- close the active portfolio without starting "
         "a new one (defaults closed date to today)\n"
+        "/list\\_portfolios -- list every open portfolio (id + name), for managing more "
+        "than one at once\n"
+        "/use\\_portfolio portfolio\\_id -- switch this chat's active pointer to a "
+        "DIFFERENT open portfolio WITHOUT closing anything (unlike /switch\\_portfolio)\n"
         "/status -- show the active portfolio's details\n"
         "/holdings -- show the active portfolio's current holdings\n"
         "/value -- live market value of current holdings, priced via NGX Pulse "
@@ -457,6 +461,48 @@ def cmd_log_trade(chat_id: str, args: list) -> str:
     )
 
 
+def cmd_list_portfolios(chat_id: str, args: list) -> str:
+    """Lists every open (status=active) portfolio across the whole
+    system -- see db.list_active_portfolios's docstring for why this
+    isn't scoped per chat. Use /use_portfolio with an id shown here to
+    switch this chat's active pointer to any of them WITHOUT closing
+    anything (unlike /switch_portfolio, which always closes the current
+    one first)."""
+    portfolios = db.list_active_portfolios()
+    if not portfolios:
+        return "No open portfolios. Use /new\\_portfolio to create one."
+    current = _require_active_portfolio(chat_id)
+    current_id = current["id"] if current else None
+    lines = []
+    for p in portfolios:
+        marker = " (current)" if p["id"] == current_id else ""
+        lines.append(f"[{p['id'][:8]}] {_escape_md(p['name'])} -- {_escape_md(p['broker'])}{marker}")
+    return "*Open portfolios*\n\n" + "\n".join(lines) + "\n\nUse /use\\_portfolio <id> to switch."
+
+
+def cmd_use_portfolio(chat_id: str, args: list) -> str:
+    """Switches this chat's active pointer to an EXISTING open portfolio
+    by id (full or its first 8 chars, same prefix-matching UX as /ack
+    and /undo_trade) -- WITHOUT closing anything, unlike
+    /switch_portfolio. This is how one chat manages multiple
+    simultaneously-open portfolios side by side: /list_portfolios to see
+    the ids, /use_portfolio to point at whichever one you're working on
+    right now, then /status, /holdings, /log_trade etc. all operate on
+    that one until you switch again. Only matches portfolios with
+    status=active (db.list_active_portfolios) -- a closed portfolio
+    can't be switched back to this way, preventing an accidental
+    reactivation of something deliberately closed out."""
+    if not args:
+        return "Usage: /use\\_portfolio portfolio\\_id (full id or its first 8 chars, shown in /list\\_portfolios)"
+    target = args[0]
+    all_portfolios = db.list_active_portfolios()
+    match = next((p for p in all_portfolios if p["id"] == target or p["id"].startswith(target)), None)
+    if not match:
+        return f"No open portfolio matching '{_escape_md(target)}' found. Use /list\\_portfolios to see options."
+    db.set_active_portfolio(chat_id, match["id"])
+    return f"Switched active portfolio to:\n\n{_fmt_portfolio(match)}"
+
+
 def cmd_close_portfolio(chat_id: str, args: list) -> str:
     """Closes the active portfolio WITHOUT creating a replacement (unlike
     /switch_portfolio, which does both). db.close_portfolio alone does
@@ -560,6 +606,8 @@ COMMANDS = {
     "/new_portfolio": cmd_new_portfolio,
     "/switch_portfolio": cmd_switch_portfolio,
     "/close_portfolio": cmd_close_portfolio,
+    "/list_portfolios": cmd_list_portfolios,
+    "/use_portfolio": cmd_use_portfolio,
     "/status": cmd_status,
     "/holdings": cmd_holdings,
     "/value": cmd_value,
