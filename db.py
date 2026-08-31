@@ -163,6 +163,25 @@ def get_portfolio(portfolio_id: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def list_active_portfolios() -> list:
+    """Every portfolio with status='active', across the whole system --
+    NOT scoped per chat, because the portfolios table has no chat_id
+    column at all (only telegram_chats.active_portfolio_id tracks the
+    CURRENT single pointer per chat, never history). This system is
+    single-user in practice (one competitor, one DB), so that's fine --
+    lets a chat managing multiple simultaneously-open portfolios (e.g.
+    the competition portfolio and a personal account) see all of them
+    via bot.py's /list_portfolios and switch between them via
+    /use_portfolio, without either ever needing to be closed just to
+    check on the other."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(portfolios).where(portfolios.c.status == "active")
+            .order_by(portfolios.c.created_at)
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------
 # Telegram chat <-> active portfolio
 # ---------------------------------------------------------------------
