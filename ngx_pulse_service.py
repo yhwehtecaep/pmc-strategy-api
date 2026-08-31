@@ -1,11 +1,11 @@
 """
 ngx_pulse_service.py
 
-Live market-data client for NGX Pulse (ngxpulse.ng) -- the deployed bot/
-API's live price source (project decision, confirmed: NGX Pulse stays the
-live source, stockanalysis.com scraping in fundamentals_service.py is
-unrelated and unchanged). Updates every ~20 minutes during the trading
-session per project history.
+Live market-data client for the exchange-data API formerly at ngxpulse.ng
+-- the deployed bot/API's live price source (project decision, confirmed:
+this stays the live source, stockanalysis.com scraping in
+fundamentals_service.py is unrelated and unchanged). Updates every ~20
+minutes during the trading session per project history.
 
 Unreachable from this sandbox (not in the network egress allowlist -- same
 constraint as stockanalysis.com, api.telegram.org, supabase.co). Tested via
@@ -13,15 +13,44 @@ replay of real captured responses in real_data_helpers.py, same discipline
 as test_fundamentals_real_data.py and test_screen_real_data.py: only
 requests.get() is mocked, all parsing/business logic below runs for real.
 
+DOMAIN MIGRATION -- CONFIRMED 2026-08-31 (live curl, not assumption):
+ngxpulse.ng now returns 308 Permanent Redirect (with a `Deprecation: true`
+response header) to https://koboterminal.com for the same
+/api/ngxdata/... paths. NGX_PULSE_BASE_URL below now defaults directly to
+https://koboterminal.com rather than relying on the redirect indefinitely
+-- the deprecation header suggests ngxpulse.ng could stop resolving
+entirely at some point. This is a genuine platform rename/migration, a
+different finding from an earlier session's check of "Mansa Markets" (a
+separate, unrelated product from the same space) -- that check was correct
+at the time; this is new information from this session.
+
+PLAN TIER -- CONFIRMED 2026-08-31 (live curl against
+/api/ngxdata/prices/MTNN?days=130, real 403 response): the account
+currently on file is on the koboterminal.com FREE plan, which caps
+historical price requests at `days<=7` -- NOT the ~100-request/day
+"Personal tier" this module's DAILY_REQUEST_QUOTA constant below was
+written to describe. A `days=130` request (DEFAULT_LOOKBACK_DAYS, what
+screening actually needs -- compute_momentum_vol_from_price_series
+requires >=100 data points) 403s on the Free plan with a clear
+"Starter plan required for historical data" error body, on EVERY symbol
+uniformly. This was previously invisible: get_price_series's fail-soft
+design returned None for every symbol with nothing logged, so a full-
+universe screen surfaced only as "0 eligible symbols" downstream with no
+diagnostic trail -- see the logging added throughout this module below.
+DAILY_REQUEST_QUOTA is left as-is (unconfirmed against the current plan)
+rather than guessed at; the days<=7 cap is the actual current blocker, not
+a request-count cap. Full 130-day screening will keep 403ing until either
+the plan is upgraded (Starter, ~NGN29,000/month) or the screening lookback
+is redesigned around what the Free plan actually allows.
+
 AUTH -- CONFIRMED (2026-08-29, against a real prior successful live call):
-base URL is https://ngxpulse.ng (unchanged), and auth is an `X-API-Key`
-header, NOT `Authorization: Bearer` -- the previous default in this file
-was wrong and would have 401'd on first live deployment. NGX_PULSE_BASE_URL
-and NGX_PULSE_API_KEY are still read from environment variables so this
-can be pointed at the real endpoint without a code change; set
-NGX_PULSE_API_KEY on Render (and in Colab for testing) to a real key.
-The specific key used to confirm this was pasted in a chat session and
-should be rotated before relying on it in production.
+auth is an `X-API-Key` header, NOT `Authorization: Bearer` -- the previous
+default in this file was wrong and would have 401'd on first live
+deployment. NGX_PULSE_BASE_URL and NGX_PULSE_API_KEY are still read from
+environment variables so this can be pointed at the real endpoint without
+a code change; set NGX_PULSE_API_KEY on Render (and in Colab for testing)
+to a real key. The specific key used to confirm this was pasted in a chat
+session and should be rotated before relying on it in production.
 
 SCOPE DECISION (confirmed with the user, changes what "quota-aware" means
 here): the bot's live price needs are for symbols actually HELD across
@@ -64,23 +93,25 @@ captured responses this session):
     days is HARD-CAPPED at 1,000 by NGX Pulse itself; oldest data ~May 2022.
   - GET /health -- discovery endpoint, lists valid route patterns.
 
-TODO (confirm with the user / against a real successful Colab call before
-first live deployment): the exact base URL and whether the Personal tier
-requires an API key/auth header at all -- NGX_PULSE_BASE_URL defaults to
-"https://ngxpulse.ng" and NGX_PULSE_API_KEY defaults to unset (no auth
-header sent) below, both overridable via environment variables, but neither
-was independently re-verified in this session; project history documents
-the *response shapes* (confirmed real, used throughout this module) but not
-a live-tested base URL/auth combination from within this codebase.
+RESOLVED (was a TODO in an earlier session, now confirmed live 2026-08-31,
+see DOMAIN MIGRATION and PLAN TIER notes above): base URL is
+https://koboterminal.com, auth header is confirmed working (X-API-Key
+reaches the server and gets a real, structured response), and the current
+blocker is plan tier (days<=7 on Free), not URL or auth. Both
+NGX_PULSE_BASE_URL and NGX_PULSE_API_KEY remain overridable via
+environment variables.
 """
 
+import logging
 import os
 from typing import Iterable, Optional
 
 import pandas as pd
 import requests
 
-NGX_PULSE_BASE_URL = os.environ.get("NGX_PULSE_BASE_URL", "https://ngxpulse.ng").rstrip("/")
+logger = logging.getLogger(__name__)
+
+NGX_PULSE_BASE_URL = os.environ.get("NGX_PULSE_BASE_URL", "https://koboterminal.com").rstrip("/")
 NGX_PULSE_API_KEY = os.environ.get("NGX_PULSE_API_KEY", "")
 REQUEST_TIMEOUT = 15
 MAX_DAYS_PER_REQUEST = 1000   # NGX Pulse's own documented hard cap on ?days=
@@ -142,19 +173,55 @@ def get_price_series(symbol: str, days: int = DEFAULT_LOOKBACK_DAYS) -> Optional
     (network failure, success=False, or an empty/malformed prices list) --
     a caller screening many symbols shouldn't have one bad symbol kill the
     whole run, matching fundamentals_service's fail-soft convention at the
-    top-level function."""
+    top-level function.
+
+    IMPORTANT: "fail-soft" means the CALLER never has to handle an
+    exception -- it does NOT mean the failure is silent. Every return-None
+    path below logs the real reason (HTTP status + response body for HTTP
+    errors, exception text otherwise) via the module logger, specifically
+    so a uniform failure across many/all symbols (auth broken, wrong URL,
+    plan/quota block, endpoint shape changed) shows up clearly in Render's
+    logs instead of just presenting as "0 eligible symbols" downstream
+    with no diagnostic trail -- the same class of previously-silent
+    failure already fixed twice elsewhere in this project (Telegram
+    Markdown 400s, requests.post not raising on non-2xx)."""
     try:
         raw = fetch_price_history_raw(symbol, days=days)
-    except (requests.RequestException, ValueError):
+    except requests.HTTPError as e:
+        resp = e.response
+        body_preview = (resp.text or "")[:300] if resp is not None else ""
+        status = resp.status_code if resp is not None else "unknown"
+        logger.warning(
+            "NGX Pulse price history request failed for %s: HTTP %s - %s",
+            symbol, status, body_preview,
+        )
         return None
-    if not raw.get("success") or not raw.get("prices"):
+    except (requests.RequestException, ValueError) as e:
+        logger.warning("NGX Pulse price history request failed for %s: %s", symbol, e)
         return None
+
+    if not raw.get("success"):
+        logger.warning(
+            "NGX Pulse price history for %s returned success=False: %s",
+            symbol, str(raw)[:300],
+        )
+        return None
+    if not raw.get("prices"):
+        logger.warning("NGX Pulse price history for %s returned an empty prices list.", symbol)
+        return None
+
     df = pd.DataFrame(raw["prices"])
     if "trade_date" not in df.columns or "close_price" not in df.columns:
+        logger.warning(
+            "NGX Pulse price history for %s is missing expected columns "
+            "(trade_date/close_price); got columns=%s -- response shape may have changed.",
+            symbol, list(df.columns),
+        )
         return None
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df = df.sort_values("trade_date")
     if df["close_price"].isna().all():
+        logger.warning("NGX Pulse price history for %s has close_price entirely NaN.", symbol)
         return None
     return pd.Series(df["close_price"].values, index=df["trade_date"].values, name=symbol)
 
@@ -198,7 +265,13 @@ def get_price_series_for_symbols(
     returned no usable data, so a caller can distinguish "try again later"
     from "genuinely no data" only by re-checking count vs. budget if
     needed -- kept simple deliberately since both cases currently resolve
-    the same way (retry on a later run)."""
+    the same way (retry on a later run).
+
+    If EVERY symbol ends up skipped for the same reason (auth broken,
+    wrong base URL, plan/quota block, endpoint shape changed), that reason
+    is now logged per-symbol by get_price_series -- check the logs, not
+    just this function's skipped list, to tell "uniform failure" apart
+    from "a handful of genuinely illiquid/delisted names"."""
     price_series_by_symbol = {}
     skipped = []
     requests_made = 0
