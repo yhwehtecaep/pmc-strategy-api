@@ -827,6 +827,87 @@ with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_m
 
 
 # =======================================================================
+print("\n=== SECTION 15: /list_portfolios, /use_portfolio -- multiple open portfolios ===")
+# =======================================================================
+
+with patch.object(bot, "TELEGRAM_WEBHOOK_SECRET", ""), patch.object(bot, "send_message", side_effect=_fake_send_message):
+    chat = "chat_multi_portfolio"
+
+    # Create Portfolio A (no trades yet) and Portfolio B (has a position) --
+    # exactly the user's real scenario. /new_portfolio for B would normally
+    # CLOSE A first -- that's the whole reason /use_portfolio needs to exist.
+    client.post("/telegram/webhook", json=_telegram_message_update(
+        chat, '/new_portfolio "Portfolio A (fresh)" Ticker NGN 1000000 2026-01-01'
+    ))
+    portfolio_a_id = db.get_active_portfolio(chat)["id"]
+
+    client.post("/telegram/webhook", json=_telegram_message_update(
+        chat, '/switch_portfolio "Portfolio B (has positions)" Ticker NGN 2000000 2026-01-01'
+    ))
+    portfolio_b_id = db.get_active_portfolio(chat)["id"]
+    db.upsert_holdings(portfolio_b_id, [{"symbol": "GTCO", "shares": 100, "avg_cost": 45.0, "sector": "Banking"}])
+
+    check("/switch_portfolio DID close Portfolio A (expected -- this is why /use_portfolio is needed)",
+          db.get_portfolio(portfolio_a_id)["status"] == "closed", db.get_portfolio(portfolio_a_id))
+
+    # Re-open Portfolio A as a genuinely separate, still-active portfolio
+    # (simulating: A was created fresh via /new_portfolio in a real
+    # scenario where the user didn't realize /switch_portfolio closes it --
+    # here we just directly flip it back to active to set up the "two
+    # simultaneously open portfolios" state for the actual test).
+    with db.engine.begin() as conn:
+        conn.execute(db.portfolios.update().where(db.portfolios.c.id == portfolio_a_id).values(status="active"))
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/list_portfolios"))
+    list_reply = sent_messages[-1]["text"]
+    check("/list_portfolios shows both open portfolios", "Portfolio A" in list_reply and "Portfolio B" in list_reply, list_reply)
+    check("/list_portfolios marks the currently-active one", "(current)" in list_reply, list_reply)
+    check("/list_portfolios does NOT show the closed one from earlier in this test",
+          "chat_flow_1" not in list_reply, list_reply)  # sanity: unrelated chat's data isn't leaking in
+
+    # Switch to Portfolio A WITHOUT closing Portfolio B
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, f"/use_portfolio {portfolio_a_id[:8]}"))
+    check("/use_portfolio confirms the switch", "Switched active portfolio" in sent_messages[-1]["text"], sent_messages)
+    check("/use_portfolio actually repointed the chat's active portfolio",
+          db.get_active_portfolio(chat)["id"] == portfolio_a_id, db.get_active_portfolio(chat))
+    check("/use_portfolio to A did NOT close Portfolio B (the whole point)",
+          db.get_portfolio(portfolio_b_id)["status"] == "active", db.get_portfolio(portfolio_b_id))
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/holdings"))
+    check("/holdings after switching to A correctly shows A's (empty) holdings, not B's",
+          "No holdings" in sent_messages[-1]["text"], sent_messages)
+
+    # Switch back to B WITHOUT closing A
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, f"/use_portfolio {portfolio_b_id[:8]}"))
+    check("/use_portfolio back to B did NOT close Portfolio A",
+          db.get_portfolio(portfolio_a_id)["status"] == "active", db.get_portfolio(portfolio_a_id))
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/holdings"))
+    check("/holdings after switching back to B correctly shows B's GTCO position",
+          "GTCO" in sent_messages[-1]["text"], sent_messages)
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/use_portfolio nonexistent12345"))
+    check("/use_portfolio with no matching id returns a clear 'not found' message",
+          "No open portfolio matching" in sent_messages[-1]["text"], sent_messages)
+
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, "/use_portfolio"))
+    check("/use_portfolio with no argument returns usage", "Usage:" in sent_messages[-1]["text"], sent_messages)
+
+    # A closed portfolio can't be switched back to via /use_portfolio
+    db.close_portfolio(portfolio_a_id)
+    sent_messages.clear()
+    client.post("/telegram/webhook", json=_telegram_message_update(chat, f"/use_portfolio {portfolio_a_id[:8]}"))
+    check("/use_portfolio refuses to switch to a CLOSED portfolio (prevents accidental reactivation)",
+          "No open portfolio matching" in sent_messages[-1]["text"], sent_messages)
+
+
+# =======================================================================
 print("\n" + "=" * 60)
 print(f"TOTAL: {len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
