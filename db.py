@@ -125,6 +125,28 @@ fundamentals_cache = Table(
     Column("fetched_at", DateTime, default=datetime.utcnow),
 )
 
+price_history = Table(
+    "price_history", metadata,
+    Column("symbol", String, primary_key=True),
+    Column("trade_date", Date, primary_key=True),
+    Column("close_price", Numeric, nullable=False),
+    Column("volume", Numeric),
+    Column("fetched_at", DateTime, default=datetime.utcnow),
+)
+# NOT portfolio-scoped, same reasoning as fundamentals_cache -- a price on
+# a given date is a fact about the stock, not about who holds it, so every
+# portfolio using this bot shares one accumulated history.
+#
+# WHY THIS TABLE EXISTS: koboterminal.com's Free plan (the account this
+# project is currently on, confirmed 2026-08-31) caps historical price
+# requests at days<=7 -- screening_service needs >=100 data points per
+# symbol for momentum/vol, which a single live call can no longer provide
+# on this plan. This table lets a small days<=7 pull, run daily, accumulate
+# into a real usable window over time via upsert (see upsert_price_history),
+# the same way the existing raw_price_history.json panel in the project's
+# GitHub repo was almost certainly built -- see ngx_pulse_service.py's
+# module docstring for the full incident writeup.
+
 
 def init_db():
     """Creates all tables if they don't already exist. Safe to call on
@@ -558,3 +580,73 @@ def cache_fundamentals(symbol: str, as_of_date: date, roe: Optional[float], pe: 
             conn.execute(fundamentals_cache.insert().values(
                 symbol=symbol, as_of_date=as_of_date, **values,
             ))
+
+
+# ---------------------------------------------------------------------
+# Price history (accumulated daily, shared across all portfolios)
+# ---------------------------------------------------------------------
+
+def upsert_price_history(symbol: str, rows: list):
+    """rows: [{"trade_date": date, "close_price": float, "volume": float|None}, ...]
+    Upserts each (symbol, trade_date) row independently -- same
+    select-then-update-or-insert idiom as cache_fundamentals, just looped
+    per row, since one daily fetch typically returns several overlapping
+    days (days=7 pulled daily means most rows already exist and are just
+    re-confirmed, which is intentional: it's the cheap safety net against
+    a single missed day silently leaving a gap in the accumulated window).
+    Never deletes -- this ACCUMULATES history over time, unlike
+    upsert_holdings' full-replace semantics; a caller wanting to wipe and
+    reload a symbol's history entirely should do so explicitly, there is
+    no delete_price_history here by design (accidental data loss on a
+    slow-to-rebuild accumulated window is a worse failure mode than a
+    missing convenience function)."""
+    with engine.begin() as conn:
+        for row in rows:
+            trade_date = row["trade_date"]
+            existing = conn.execute(
+                select(price_history).where(and_(
+                    price_history.c.symbol == symbol,
+                    price_history.c.trade_date == trade_date,
+                ))
+            ).first()
+            values = dict(
+                close_price=row["close_price"], volume=row.get("volume"),
+                fetched_at=datetime.utcnow(),
+            )
+            if existing:
+                conn.execute(
+                    update(price_history).where(and_(
+                        price_history.c.symbol == symbol,
+                        price_history.c.trade_date == trade_date,
+                    )).values(**values)
+                )
+            else:
+                conn.execute(price_history.insert().values(
+                    symbol=symbol, trade_date=trade_date, **values,
+                ))
+
+
+def get_price_history(symbol: str, since: Optional[date] = None) -> list:
+    """Returns this symbol's accumulated history as a list of dicts,
+    ascending by trade_date. `since` filters to trade_date >= since (e.g.
+    for a 130-day screening lookback window) -- omit for the full
+    accumulated history. Deliberately returns plain dicts, not a
+    pandas.Series -- db.py has no pandas dependency anywhere else and this
+    keeps that boundary intact; converting to the Series shape
+    screening_service expects is the caller's job (see
+    price_history_service.py)."""
+    with engine.connect() as conn:
+        query = select(price_history).where(price_history.c.symbol == symbol)
+        if since is not None:
+            query = query.where(price_history.c.trade_date >= since)
+        rows = conn.execute(query.order_by(price_history.c.trade_date)).mappings().all()
+        return [dict(r) for r in rows]
+
+
+def get_price_history_symbols() -> list:
+    """Distinct symbols with at least one accumulated price row -- lets a
+    caller check coverage (e.g. "which universe symbols have we started
+    accumulating history for yet?") without pulling every row."""
+    with engine.connect() as conn:
+        rows = conn.execute(select(price_history.c.symbol).distinct()).all()
+        return [r[0] for r in rows]
