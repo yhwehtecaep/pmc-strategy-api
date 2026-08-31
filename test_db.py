@@ -376,6 +376,28 @@ check("same type+symbol but different portfolio is NOT deduped against portfolio
 
 
 # ---------------------------------------------------------------------
+print("\n=== list_active_portfolios (supports bot.py's /list_portfolios, /use_portfolio) ===")
+before_count = len(db.list_active_portfolios())
+
+pid_la1 = db.create_portfolio("List Test A", "Ticker", "NGN", 1_000_000, date(2026, 1, 1))
+pid_la2 = db.create_portfolio("List Test B", "Ticker", "NGN", 500_000, date(2026, 2, 1))
+pid_la3 = db.create_portfolio("List Test C (will be closed)", "Ticker", "NGN", 250_000, date(2026, 3, 1))
+db.close_portfolio(pid_la3)
+
+active_list = db.list_active_portfolios()
+check("list_active_portfolios includes newly-created active portfolios",
+      pid_la1 in [p["id"] for p in active_list] and pid_la2 in [p["id"] for p in active_list], active_list)
+check("list_active_portfolios EXCLUDES a closed portfolio",
+      pid_la3 not in [p["id"] for p in active_list], active_list)
+check("list_active_portfolios grew by exactly 2 (the two active ones, not the closed one)",
+      len(active_list) == before_count + 2, (before_count, len(active_list)))
+
+names_in_list = {p["id"]: p["name"] for p in active_list}
+check("list_active_portfolios returns full portfolio dicts (name matches)",
+      names_in_list[pid_la1] == "List Test A" and names_in_list[pid_la2] == "List Test B", names_in_list)
+
+
+# ---------------------------------------------------------------------
 print("\n=== Fundamentals cache (shared across portfolios, keyed by symbol+as_of_date) ===")
 d1 = date(2026, 8, 1)
 cached_before = db.get_cached_fundamentals("DANGCEM", d1)
