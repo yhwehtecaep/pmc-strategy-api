@@ -47,6 +47,7 @@ import db
 import bot as tg_bot
 import ngx_pulse_service as nps
 import monthly_screen_service as mss
+import price_history_service as phs
 import requests
 
 app = FastAPI(
@@ -775,4 +776,84 @@ def monthly_screen(
     return {
         "status": "accepted",
         "detail": "Monthly screen started in the background; results will be sent via Telegram.",
+    }
+
+
+# ---------------------------------------------------------------------
+# Daily price history accumulation
+# ---------------------------------------------------------------------
+# Works around koboterminal.com's Free-plan restriction (confirmed
+# 2026-08-31: a single days=130 request 403s uniformly on every symbol --
+# see ngx_pulse_service.py's module docstring for the incident writeup)
+# by pulling a small days<=7 window daily and accumulating it in db.py's
+# price_history table via price_history_service.py. This is genuinely
+# routine infrastructure (unlike /monthly-screen, which represents a real
+# portfolio decision point) -- failures are logged via
+# price_history_service's existing per-symbol logging and visible in
+# Render's logs, not pushed to Telegram, to avoid a daily notification for
+# something that isn't actionable most days.
+
+DAILY_PRICE_UPDATE_SECRET = os.environ.get("DAILY_PRICE_UPDATE_SECRET", "")
+
+
+def _run_daily_price_update_task():
+    """Background task body: resolves which symbols to update (live
+    universe union already-tracked symbols -- see
+    price_history_service.get_symbols_to_update), then pulls days<=7 per
+    symbol and upserts. Intentionally synchronous/no return value used --
+    this runs off the request/response path via BackgroundTasks, same as
+    monthly_screen; the result is logged, not returned anywhere, since
+    nothing is waiting on this response."""
+    try:
+        symbols = phs.get_symbols_to_update()
+        result = phs.run_daily_price_update(symbols)
+        print(
+            f"Daily price update: {len(result['symbols_updated'])} updated, "
+            f"{len(result['symbols_failed'])} failed, out of {len(symbols)} symbols."
+        )
+    except Exception as e:  # noqa: BLE001 -- background task, nothing else observes this
+        print(f"Daily price update failed entirely: {e}")
+
+
+@app.post("/daily-price-update")
+def daily_price_update(
+    background_tasks: BackgroundTasks,
+    x_daily_price_update_secret: Optional[str] = Header(default=None),
+):
+    """Kicks off the daily days<=7 price-history accumulation pull in the
+    background and returns immediately. Requires
+    X-Daily-Price-Update-Secret to match DAILY_PRICE_UPDATE_SECRET when
+    that env var is configured -- same secret-header pattern as
+    /monthly-screen, since this still triggers real NGX Pulse/Kobo
+    Terminal requests and shouldn't be triggerable by anyone who finds the
+    URL. Intended to be called once a day by a scheduled GitHub Actions
+    workflow (see .github/workflows/daily-price-update.yml), not by hand."""
+    if DAILY_PRICE_UPDATE_SECRET and x_daily_price_update_secret != DAILY_PRICE_UPDATE_SECRET:
+        raise HTTPException(status_code=401, detail="invalid daily price update secret")
+    background_tasks.add_task(_run_daily_price_update_task)
+    return {
+        "status": "accepted",
+        "detail": "Daily price update started in the background; check Render logs for the result.",
+    }
+
+
+@app.post("/price-history/seed")
+def price_history_seed(
+    background_tasks: BackgroundTasks,
+    x_daily_price_update_secret: Optional[str] = Header(default=None),
+):
+    """ONE-TIME manual trigger for price_history_service.seed_from_repo_panel()
+    -- backfills price_history from the project's existing
+    raw_price_history.json (real history back to Feb 2026) so the daily
+    accumulation job starts from a near-full window instead of empty.
+    Idempotent (safe to call more than once -- upserts, never duplicates),
+    but there's normally no reason to call it after the first time. Reuses
+    DAILY_PRICE_UPDATE_SECRET rather than a third secret -- this endpoint
+    is closely related to /daily-price-update and doesn't need its own."""
+    if DAILY_PRICE_UPDATE_SECRET and x_daily_price_update_secret != DAILY_PRICE_UPDATE_SECRET:
+        raise HTTPException(status_code=401, detail="invalid daily price update secret")
+    background_tasks.add_task(phs.seed_from_repo_panel)
+    return {
+        "status": "accepted",
+        "detail": "Price history seed started in the background; check Render logs for the result.",
     }
