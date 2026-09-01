@@ -134,10 +134,30 @@ def fetch_stocks_snapshot() -> pd.DataFrame:
     """One request, full market snapshot -- current_price, sector, market,
     etc. for every listed symbol. Raises requests.RequestException on
     network failure (caller decides how to handle; this is the raw fetch,
-    not the fail-soft convenience wrapper -- see get_current_prices_and_sectors)."""
+    not the fail-soft convenience wrapper -- see get_current_prices_and_sectors).
+
+    Unlike get_price_series, this function does NOT swallow failures into
+    None -- it still raises, same contract as before. The addition here is
+    purely diagnostic: on an HTTP error, the real status code + response
+    body are logged before re-raising, so Render's logs show the actual
+    reason (e.g. a structured plan/quota error, same shape as the 403 that
+    caused the original "0 eligible symbols" incident on the price-history
+    endpoint) rather than just str(exception)'s default summary. Callers
+    that already catch and report this exception (e.g.
+    monthly_screen_service's broad try/except) still get the same
+    behavior; this just gives Render's logs more to go on."""
     url = f"{NGX_PULSE_BASE_URL}/api/ngxdata/stocks"
-    resp = requests.get(url, headers=_headers(), timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(url, headers=_headers(), timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        body_preview = (e.response.text or "")[:300] if e.response is not None else ""
+        status = e.response.status_code if e.response is not None else "unknown"
+        logger.warning("NGX Pulse /stocks snapshot request failed: HTTP %s - %s", status, body_preview)
+        raise
+    except requests.RequestException as e:
+        logger.warning("NGX Pulse /stocks snapshot request failed: %s", e)
+        raise
     return pd.DataFrame(resp.json()["stocks"])
 
 
