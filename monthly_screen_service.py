@@ -36,6 +36,7 @@ import screening_service as ss
 import portfolio_service as ps
 import ngx_pulse_service as nps
 import universe_service as us
+import price_history_service as phs
 import db
 
 FUNDAMENTALS_CACHE_MAX_AGE_DAYS = 1  # refreshed daily; avoids re-scraping ~75 names per screen
@@ -124,9 +125,27 @@ def run_monthly_screen_and_notify(
             )
             return
 
-        price_series_by_symbol, skipped = nps.get_price_series_for_symbols(
-            symbols, days=lookback_days, max_requests=max_ngx_pulse_requests,
+        price_series_by_symbol, skipped = phs.load_price_series_by_symbol(
+            symbols, lookback_days=lookback_days,
         )
+        # NOTE: previously called nps.get_price_series_for_symbols(...),
+        # which made one LIVE 130-day request per symbol -- confirmed
+        # 2026-08-31 that this 403s uniformly on every symbol under the
+        # current koboterminal.com Free plan (days<=7 only), which is why
+        # this screen was returning "0 eligible symbols" with no
+        # diagnostic trail. Now reads from db.py's price_history table
+        # instead, accumulated a days<=7 pull at a time by a separate
+        # daily job (see price_history_service.py + main.py's
+        # /daily-price-update endpoint) -- no live NGX Pulse call happens
+        # in this function for price history at all anymore. `skipped`
+        # here means "not yet enough accumulated history" rather than
+        # "NGX Pulse had no data for this symbol" -- see the message text
+        # below, which was updated to reflect that distinction.
+        # max_ngx_pulse_requests is intentionally unused now (kept in this
+        # function's signature only so bot.py's and main.py's existing
+        # call sites don't need to change) -- there is no live per-symbol
+        # quota to budget for a DB read.
+        _ = max_ngx_pulse_requests
 
         as_of_dt = datetime.utcnow()
         scored = ss.screen_universe(
@@ -163,7 +182,8 @@ def run_monthly_screen_and_notify(
               f"price history; {len(ranked)} were eligible after screening."
         )
         if skipped:
-            msg += f"\n\nNo usable price history (excluded): {', '.join(escape_md_fn(s) for s in skipped)}"
+            msg += (f"\n\nNot enough accumulated price history yet (excluded): "
+                    f"{', '.join(escape_md_fn(s) for s in skipped)}")
 
         msg += _compare_against_holdings(chat_id, weights, ranked, sector_by_symbol, escape_md_fn)
 
