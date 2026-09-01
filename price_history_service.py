@@ -59,6 +59,22 @@ REPO_RAW_PRICE_HISTORY_URL = (
 )
 
 
+def get_symbols_to_update() -> list:
+    """Union of the current live universe (so new entrants get picked up
+    as soon as they qualify) and everything already being tracked in
+    price_history (so a symbol that temporarily drops out of the live
+    universe filter -- e.g. one quiet trading day pushing it under the
+    volume threshold -- doesn't lose its accumulated window and have to
+    restart from zero). Costs exactly one extra NGX Pulse /stocks snapshot
+    request (not quota-limited -- see ngx_pulse_service.py's docstring),
+    used only to decide WHICH symbols to update, not to fetch their price
+    history."""
+    import universe_service as us
+    live_symbols, _sectors, _prices = us.build_live_universe()
+    tracked_symbols = db.get_price_history_symbols()
+    return sorted(set(live_symbols) | set(tracked_symbols))
+
+
 # ---------------------------------------------------------------------
 # 1. One-time seed from the repo's existing historical panel
 # ---------------------------------------------------------------------
