@@ -1,0 +1,39 @@
+name: Daily Price Update
+# Works around koboterminal.com's Free-plan restriction (confirmed
+# 2026-08-31: a single days=130 request 403s uniformly on every symbol) by
+# pulling a small days<=7 window daily and accumulating it in db.py's
+# price_history table -- see ngx_pulse_service.py's and
+# price_history_service.py's module docstrings for the full writeup, and
+# main.py's /daily-price-update endpoint for what this triggers.
+#
+# Uses the SAME RENDER_SERVICE_URL secret as Monthly Screen (see
+# monthly-screen.yml) -- not a separate secret. Also needs its own
+# DAILY_PRICE_UPDATE_SECRET repo secret (must match the env var of the
+# same name set on Render for main.py); no TELEGRAM_CHAT_ID needed here,
+# since this is routine infrastructure with no per-chat result to deliver
+# (see main.py's docstring for why failures go to Render's logs, not
+# Telegram).
+#
+# NGX trading hours are ~10:00-14:30 WAT (UTC+1); 16:00 UTC gives a
+# comfortable margin after close for the day's data to be available.
+"on":
+  schedule:
+    - cron: "0 16 * * 1-5"  # 16:00 UTC, Monday-Friday (NGX trading days only)
+  workflow_dispatch: {}      # lets you trigger it manually from the Actions tab too
+jobs:
+  trigger-daily-price-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger /daily-price-update
+        run: |
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "${{ secrets.RENDER_SERVICE_URL }}/daily-price-update" \
+            -H "Content-Type: application/json" \
+            -H "X-Daily-Price-Update-Secret: ${{ secrets.DAILY_PRICE_UPDATE_SECRET }}")
+          echo "$RESPONSE"
+          STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Triggering /daily-price-update failed with HTTP $STATUS"
+            exit 1
+          fi
+          echo "Daily price update triggered successfully. Check Render logs for the result."
