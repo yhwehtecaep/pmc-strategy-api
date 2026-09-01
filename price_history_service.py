@@ -124,12 +124,28 @@ def seed_from_repo_panel(url: str = REPO_RAW_PRICE_HISTORY_URL) -> dict:
 # 2. Daily accumulation (days<=7 per symbol, meant to run once/day)
 # ---------------------------------------------------------------------
 
-def run_daily_price_update(symbols: Iterable[str], days: int = DAILY_FETCH_DAYS) -> dict:
+def run_daily_price_update(
+    symbols: Iterable[str],
+    days: int = DAILY_FETCH_DAYS,
+    max_requests: int = nps.DAILY_REQUEST_QUOTA,
+) -> dict:
     """Pulls up to `days` (default 7, the Free-plan cap) of recent price
     history per symbol and upserts into price_history. Deliberately does
     NOT use nps.get_price_series_for_symbols (that returns a pd.Series
     with volume already discarded) -- goes one level lower, to
     nps.fetch_price_history_raw, so volume is preserved for the DB row.
+
+    max_requests is a DEFENSIVE budget, not a confirmed limit: the only
+    Kobo Terminal restriction actually confirmed live (2026-08-31) is
+    days<=7 per request -- there is no confirmed request-COUNT quota for
+    the current Free tier specifically (nps.DAILY_REQUEST_QUOTA was
+    written for a different, unconfirmed "Personal tier" name before the
+    account's real tier was known). Stopping at a budget rather than
+    looping every symbol unconditionally is a cheap safety net in case
+    such a quota does exist and is lower than expected -- symbols beyond
+    the budget are reported in symbols_failed (with reason distinguishable
+    via the "budget exhausted" log line below) so a caller can tell that
+    apart from a genuine per-symbol failure if needed.
 
     Reuses ngx_pulse_service's existing logging (added 2026-08-31) for
     per-symbol failure visibility -- a 403/network failure on one symbol
@@ -149,9 +165,24 @@ def run_daily_price_update(symbols: Iterable[str], days: int = DAILY_FETCH_DAYS)
 
     updated = []
     failed = []
+    requests_made = 0
+    budget_warning_logged = False
     for symbol in symbols:
+        if requests_made >= max_requests:
+            if not budget_warning_logged:
+                logger.warning(
+                    "run_daily_price_update: request budget (%d) exhausted -- stopping early as "
+                    "a precaution. If this happens routinely, the account's real daily request "
+                    "quota may be lower than max_requests assumed; check Kobo Terminal's actual "
+                    "documented limit for the Free tier.",
+                    max_requests,
+                )
+                budget_warning_logged = True
+            failed.append(symbol)
+            continue
         try:
             raw = nps.fetch_price_history_raw(symbol, days=days)
+            requests_made += 1
         except Exception as e:  # noqa: BLE001 -- one bad symbol must not stop the daily run
             logger.warning("Daily price update failed for %s: %s", symbol, e)
             failed.append(symbol)
@@ -178,7 +209,8 @@ def run_daily_price_update(symbols: Iterable[str], days: int = DAILY_FETCH_DAYS)
         db.upsert_price_history(symbol, rows)
         updated.append(symbol)
 
-    logger.info("Daily price update: %d updated, %d failed.", len(updated), len(failed))
+    logger.info("Daily price update: %d updated, %d failed (requests made: %d).",
+                len(updated), len(failed), requests_made)
     return {"symbols_updated": updated, "symbols_failed": failed}
 
 
