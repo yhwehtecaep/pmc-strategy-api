@@ -65,11 +65,23 @@ portfolios = Table(
     Column("broker", String),
     Column("currency", String, default="NGN"),
     Column("initial_capital", Numeric),
+    Column("cash", Numeric),
     Column("inception_date", Date, nullable=False),
     Column("status", String, nullable=False, default="active"),  # 'active' | 'closed'
     Column("closed_date", Date),
     Column("created_at", DateTime, default=datetime.utcnow),
 )
+# MIGRATION NOTE: `cash` is a new column on an EXISTING table (unlike
+# price_history, which is a brand-new table create_all() handles for
+# free). On any DB where `portfolios` rows already exist (i.e. live
+# Render Postgres), this requires a manual, explicit migration before
+# cash tracking will work there:
+#     ALTER TABLE portfolios ADD COLUMN cash NUMERIC;
+#     UPDATE portfolios SET cash = initial_capital WHERE cash IS NULL;
+# followed by one set_cash() call per active portfolio to reconcile to
+# the real current balance. Until that migration runs, get_cash() on an
+# existing row returns None -- callers must treat that as "cash unknown"
+# and fail soft, never assume 0.
 
 holdings = Table(
     "holdings", metadata,
@@ -159,12 +171,19 @@ def init_db():
 # ---------------------------------------------------------------------
 
 def create_portfolio(name: str, broker: str, currency: str,
-                      initial_capital: float, inception_date: date) -> str:
+                      initial_capital: float, inception_date: date,
+                      initial_cash: Optional[float] = None) -> str:
+    """initial_cash defaults to initial_capital (the standard "fully in
+    cash before first deployment" starting state) if not given -- pass an
+    explicit value only when the portfolio is being created already
+    partially deployed (e.g. a mid-competition handoff)."""
     pid = _uuid()
     with engine.begin() as conn:
         conn.execute(portfolios.insert().values(
             id=pid, name=name, broker=broker, currency=currency,
-            initial_capital=initial_capital, inception_date=inception_date,
+            initial_capital=initial_capital,
+            cash=initial_cash if initial_cash is not None else initial_capital,
+            inception_date=inception_date,
             status="active", created_at=datetime.utcnow(),
         ))
     return pid
@@ -183,6 +202,33 @@ def get_portfolio(portfolio_id: str) -> Optional[dict]:
     with engine.connect() as conn:
         row = conn.execute(select(portfolios).where(portfolios.c.id == portfolio_id)).mappings().first()
         return dict(row) if row else None
+
+
+def get_cash(portfolio_id: str) -> Optional[float]:
+    """Returns None if the portfolio doesn't exist OR if its `cash` column
+    hasn't been populated yet (pre-migration row on a live DB that hasn't
+    run the ALTER TABLE + backfill described above) -- callers MUST treat
+    None as "unknown", never coerce it to 0.0 themselves without an
+    explicit fallback decision, since a real cash balance of 0 and an
+    unmigrated/unknown balance are different situations that should be
+    handled differently (see monthly_screen_service.py's cash_unavailable
+    handling)."""
+    with engine.connect() as conn:
+        row = conn.execute(select(portfolios.c.cash).where(portfolios.c.id == portfolio_id)).first()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0])
+
+
+def set_cash(portfolio_id: str, cash: float):
+    """Explicit manual override/reconciliation -- e.g. the one-time
+    post-migration backfill correction, or periodically reconciling
+    against the real live dashboard balance the way the strategy
+    documentation's Section 9 already describes doing manually."""
+    with engine.begin() as conn:
+        conn.execute(
+            update(portfolios).where(portfolios.c.id == portfolio_id).values(cash=cash)
+        )
 
 
 def list_active_portfolios() -> list:
@@ -246,7 +292,8 @@ def get_active_portfolio(chat_id: str) -> Optional[dict]:
 
 def start_new_portfolio_for_chat(chat_id: str, name: str, broker: str, currency: str,
                                   initial_capital: float, inception_date: date,
-                                  close_previous: bool = True) -> str:
+                                  close_previous: bool = True,
+                                  initial_cash: Optional[float] = None) -> str:
     """The one-call version of 'competition ended, here's the new
     portfolio': closes whatever this chat is currently pointed at (if
     close_previous, the default), creates the new portfolio, and points
@@ -255,7 +302,8 @@ def start_new_portfolio_for_chat(chat_id: str, name: str, broker: str, currency:
     previous = get_active_portfolio(chat_id)
     if close_previous and previous and previous["status"] == "active":
         close_portfolio(previous["id"])
-    new_id = create_portfolio(name, broker, currency, initial_capital, inception_date)
+    new_id = create_portfolio(name, broker, currency, initial_capital, inception_date,
+                               initial_cash=initial_cash)
     set_active_portfolio(chat_id, new_id)
     return new_id
 
@@ -315,9 +363,24 @@ def log_trade(portfolio_id: str, symbol: str, side: str, shares: float,
               sector: Optional[str] = None) -> str:
     """Logs the trade AND updates the holdings table to reflect it --
     incrementing/decrementing shares and recomputing a weighted-average
-    cost on buys. This is the one function that should be called whenever
-    a trade is actually executed on the broker, so holdings never drift
-    out of sync with the trade log."""
+    cost on buys -- AND atomically updates the portfolio's cash balance
+    in the same transaction. Buy debits (shares*price + fee); sell
+    credits (shares*price - fee) -- matches portfolio_service.
+    estimate_trade_fees's convention exactly (fees always reduce the
+    portfolio's cash, whichever side they're on). This is the one
+    function that should be called whenever a trade is actually executed
+    on the broker, so holdings AND cash never drift out of sync with the
+    trade log.
+
+    Deliberately does NOT block a trade that would drive cash negative --
+    log_trade records a trade that already happened on the real broker;
+    refusing to record it would just make the ledger wrong, not undo the
+    real trade. Negative/over-cap cash is something check_hard_breaches
+    or the monthly comparison should surface for action, not something
+    log_trade silently prevents from being recorded. If this portfolio's
+    cash is still unmigrated/unknown (get_cash returns None), cash is
+    simply left untouched here -- there is nothing correct to add/
+    subtract from an unknown balance."""
     if side not in ("buy", "sell"):
         raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
@@ -328,6 +391,18 @@ def log_trade(portfolio_id: str, symbol: str, side: str, shares: float,
             shares=shares, price=price, fee=fee, reason=reason,
             executed_at=datetime.utcnow(),
         ))
+
+        current_cash_row = conn.execute(
+            select(portfolios.c.cash).where(portfolios.c.id == portfolio_id)
+        ).first()
+        if current_cash_row is not None and current_cash_row[0] is not None:
+            current_cash = float(current_cash_row[0])
+            trade_amount = shares * price
+            cash_delta = -(trade_amount + fee) if side == "buy" else (trade_amount - fee)
+            conn.execute(
+                update(portfolios).where(portfolios.c.id == portfolio_id)
+                .values(cash=current_cash + cash_delta)
+            )
 
         existing = conn.execute(
             select(holdings).where(and_(
@@ -458,6 +533,27 @@ def delete_trade(portfolio_id: str, trade_id: str) -> dict:
         conn.execute(delete(holdings).where(
             and_(holdings.c.portfolio_id == portfolio_id, holdings.c.symbol == symbol)
         ))
+
+        # Reverse the deleted trade's OWN cash effect -- a simple additive
+        # reversal is exactly correct here (unlike avg_cost, which needs
+        # full replay), because cash is a linear running sum: reversing
+        # just the one deleted trade's delta is correct regardless of
+        # where it fell in the symbol's trade history. Skipped entirely
+        # if cash is unmigrated/unknown for this portfolio (same
+        # unknown-stays-unknown convention as log_trade).
+        current_cash_row = conn.execute(
+            select(portfolios.c.cash).where(portfolios.c.id == portfolio_id)
+        ).first()
+        if current_cash_row is not None and current_cash_row[0] is not None:
+            current_cash = float(current_cash_row[0])
+            t_shares, t_price, t_fee = float(trade["shares"]), float(trade["price"]), float(trade["fee"])
+            trade_amount = t_shares * t_price
+            # Reversal is the negation of log_trade's original delta.
+            reversal = (trade_amount + t_fee) if trade["side"] == "buy" else -(trade_amount - t_fee)
+            conn.execute(
+                update(portfolios).where(portfolios.c.id == portfolio_id)
+                .values(cash=current_cash + reversal)
+            )
 
         if shares > 1e-9:
             new_holding_id = _uuid()
