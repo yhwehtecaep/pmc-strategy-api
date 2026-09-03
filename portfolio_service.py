@@ -16,6 +16,12 @@ import numpy as np
 
 MAX_STOCK_WEIGHT = 0.25
 MAX_SECTOR_WEIGHT = 0.25
+SECTOR_WARNING_THRESHOLD = 0.22  # soft early-warning line below the 25% hard cap -- flagged
+                                  # for review, never blocks/forces action the way a real
+                                  # sector_breach does. Item #5 from the original review-
+                                  # list recommendations: Financial Services sat at 22.13%
+                                  # per the strategy doc with no code surfacing that it was
+                                  # approaching the cap until now.
 CASH_BUFFER = 0.03
 MAX_CASH = 0.05
 MIN_HOLDINGS = 5
@@ -270,6 +276,32 @@ def check_hard_breaches(weights: pd.Series, sectors: dict, cash: float,
             or cash > max_cash
             or len(weights) < min_holdings
         ),
+    }
+
+
+def check_sector_warnings(weights: pd.Series, sectors: dict,
+                            warning_threshold: float = SECTOR_WARNING_THRESHOLD,
+                            hard_cap: float = MAX_SECTOR_WEIGHT) -> dict:
+    """Soft early-warning check, separate from check_hard_breaches: flags
+    any sector sitting AT OR ABOVE warning_threshold (22%) but still
+    UNDER hard_cap (25%) -- i.e. approaching the hard cap without having
+    crossed it yet. A sector already over hard_cap is a sector_breach
+    (check_hard_breaches' job, "act immediately"); this function
+    deliberately does NOT re-flag those here, to keep the two signal
+    types non-overlapping -- a caller wanting "everything at/above 22%
+    regardless of whether it's also over 25%" should just compare
+    sector_totals directly rather than combining these two dicts.
+
+    Returns {"sector_warning": {sector: weight, ...}, "any_warning": bool}
+    -- same dict-of-offenders shape as check_hard_breaches' stock_breach/
+    sector_breach keys, for the caller to format identically."""
+    sector_totals = weights.groupby(weights.index.map(sectors)).sum()
+    warned = sector_totals[
+        (sector_totals >= warning_threshold) & (sector_totals < hard_cap)
+    ]
+    return {
+        "sector_warning": warned.to_dict(),
+        "any_warning": len(warned) > 0,
     }
 
 
