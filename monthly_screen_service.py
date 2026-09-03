@@ -218,16 +218,17 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
     /rebalance-check already uses, so they show up in /signals and can be
     /ack'd the same way regardless of which path found them.
 
-    KNOWN APPROXIMATION: cash is valued at 0 here (weights are normalized
-    across held positions only), since cash is not a persisted field
-    anywhere in db.py's schema -- see db.py's docstring and /rebalance-
-    check's own required `cash` parameter, which this automated path has
-    no way to supply. This means computed weights run slightly HIGH
-    relative to true (cash-diluted) weights -- a conservative bias for
-    cap-breach detection (more likely to flag a false positive than miss
-    a real breach), never the reverse. Cash-cap breach is therefore never
-    checked here; the message says so explicitly rather than silently
-    reporting an unverified "no cash breach"."""
+    RESOLVED (previously KNOWN APPROXIMATION): cash is now read from
+    db.get_cash(portfolio_id) and genuinely fed into both the weights
+    (via db.holdings_to_weights' cash parameter, raw currency) and the
+    hard-breach check (via a computed cash fraction, see cash_fraction
+    below). If cash hasn't been migrated/reconciled yet for this
+    portfolio (db.get_cash returns None -- see db.py's MIGRATION NOTE),
+    this falls back to treating cash as 0 for the weights calculation
+    (same conservative-bias direction as before: computed weights run
+    slightly HIGH relative to true cash-diluted weights) and the
+    cash-cap check is skipped, with the message saying so explicitly
+    rather than silently reporting an unverified "no cash breach"."""
     active = db.get_active_portfolio(chat_id)
     if not active:
         return "\n\n_No active portfolio linked to this chat -- skipping holdings comparison._"
@@ -243,19 +244,36 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
     except Exception as e:  # noqa: BLE001 -- comparison is best-effort; target weights above still stand
         return f"\n\n_Could not fetch live prices to compare against holdings: {escape_md_fn(e)}_"
 
-    actual_weights_dict = db.holdings_to_weights(holdings_list, current_prices, cash=0.0)
+    real_cash = db.get_cash(portfolio_id)
+    cash_unavailable = real_cash is None
+    cash = real_cash if real_cash is not None else 0.0
+
+    # holdings_to_weights' cash parameter is raw currency -- confirmed
+    # against its own docstring/contract and main.py's /rebalance-check,
+    # which uses it the same way.
+    actual_weights_dict = db.holdings_to_weights(holdings_list, current_prices, cash=cash)
     sectors = {h["symbol"]: h["sector"] for h in holdings_list}
     sectors.update(sector_by_symbol)  # fill in sector for any symbol not in current holdings
 
     actual = pd.Series(actual_weights_dict)
+    # holdings_to_weights returns weights summing to market_value/total
+    # (cash is deliberately not a key in that dict) -- so 1 - actual.sum()
+    # IS the cash fraction. check_hard_breaches' cash parameter is a 0-1
+    # FRACTION (compared against MAX_CASH=0.05), NOT raw currency -- this
+    # is a different unit than holdings_to_weights' cash parameter above;
+    # passing raw currency here would make cash_breach evaluate True
+    # permanently for any nonzero balance. See portfolio_service.
+    # check_hard_breaches and main.py's /rebalance-check for the same
+    # distinction documented there.
+    cash_fraction = 1.0 - actual.sum()
     drift_df = ps.check_drift(actual, fresh_target_weights, drift_threshold=ps.DRIFT_THRESHOLD)
-    breaches = ps.check_hard_breaches(actual, sectors, cash=0.0)
+    breaches = ps.check_hard_breaches(actual, sectors, cash=cash_fraction)
     additions = ps.identify_diversification_additions(held_symbols, ranked, floor=ps.DIVERSIFICATION_FLOOR)
 
     sections = [f"\n\n*Comparison against current holdings -- {escape_md_fn(active['name'])}*"]
     any_flag = False
 
-    if breaches["stock_breach"] or breaches["sector_breach"] or breaches["holdings_breach"]:
+    if breaches["stock_breach"] or breaches["sector_breach"] or breaches["holdings_breach"] or breaches["cash_breach"]:
         any_flag = True
         breach_lines = []
         for sym, w in breaches["stock_breach"].items():
@@ -264,6 +282,8 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
             breach_lines.append(f"{escape_md_fn(sector)} sector: {_fmt_pct(w)} (sector cap {_fmt_pct(ps.MAX_SECTOR_WEIGHT)})")
         if breaches["holdings_breach"]:
             breach_lines.append(f"Only {len(holdings_list)} holdings (minimum {ps.MIN_HOLDINGS})")
+        if breaches["cash_breach"]:
+            breach_lines.append(f"Cash: {_fmt_pct(cash_fraction)} of portfolio (cash cap {_fmt_pct(ps.MAX_CASH)})")
         sections.append("*HARD BREACHES -- act immediately:*\n" + "\n".join(breach_lines))
 
     triggered = drift_df[drift_df["triggered"] | drift_df["fresh_target"].isna()]
@@ -297,7 +317,14 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
     if not any_flag:
         sections.append("No hard breaches, no meaningful drift, holdings at/above the diversification floor.")
 
-    sections.append("_Cash-cap breach not checked automatically -- cash isn't tracked in this system._")
+    if cash_unavailable:
+        sections.append(
+            "_Cash could not be read for this portfolio (pre-migration or uninitialized) -- "
+            "cash-cap check ran in fallback mode (assumed 0). Run the ALTER TABLE migration "
+            "and reconcile with db.set_cash() to enable real cash-cap checking._"
+        )
+    # else: no caveat needed -- cash is genuinely tracked and checked now,
+    # and a breach (or lack of one) is already shown above.
 
     # Persist signals via the SAME dedup mechanism /rebalance-check uses, so
     # /signals and /ack work identically regardless of which path found them.
@@ -307,6 +334,8 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
         db.log_signal_if_new(portfolio_id, "sector_breach", sector, {"weight": w})
     if breaches["holdings_breach"]:
         db.log_signal_if_new(portfolio_id, "holdings_breach", None, {"holdings_count": len(holdings_list)})
+    if breaches["cash_breach"]:
+        db.log_signal_if_new(portfolio_id, "cash_breach", None, {"cash_fraction": cash_fraction})
     for sym, row in triggered.iterrows():
         db.log_signal_if_new(
             portfolio_id, "drift", sym,
