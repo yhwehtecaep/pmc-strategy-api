@@ -285,6 +285,14 @@ class RebalanceCheckResponse(BaseModel):
     drift_rows: List[DriftRow]
     any_drift_triggered: bool
     hard_breaches: dict
+    sector_warnings: dict = Field(
+        default_factory=dict,
+        description="Soft early-warning check (portfolio_service.check_sector_warnings): "
+                     "sectors at/above SECTOR_WARNING_THRESHOLD (22%) but still under the "
+                     "25% hard cap. Deliberately NOT included in action_required -- this is "
+                     "advance notice to watch a sector, not a compliance breach requiring "
+                     "immediate action the way hard_breaches does.",
+    )
     action_required: bool = Field(
         description="True if either a hard breach exists (must act immediately, "
                      "any fee cost) or a drift threshold was crossed (act at next "
@@ -404,6 +412,7 @@ def rebalance_check(payload: RebalanceCheckRequest):
     any_drift = any(r.triggered for r in drift_rows)
 
     breaches = ps.check_hard_breaches(actual, sectors, payload.cash)
+    sector_warnings = ps.check_sector_warnings(actual, sectors)
 
     signals_logged: List[str] = []
     if payload.portfolio_id and payload.persist_signals:
@@ -433,11 +442,16 @@ def rebalance_check(payload: RebalanceCheckRequest):
             )
             if sid:
                 signals_logged.append(sid)
+        for sector, w in sector_warnings["sector_warning"].items():
+            sid = db.log_signal_if_new(payload.portfolio_id, "sector_warning", sector, {"weight": w})
+            if sid:
+                signals_logged.append(sid)
 
     return RebalanceCheckResponse(
         drift_rows=drift_rows,
         any_drift_triggered=any_drift,
         hard_breaches=breaches,
+        sector_warnings=sector_warnings,
         action_required=bool(breaches["any_breach"]) or any_drift,
         signals_logged=signals_logged,
         missing_prices=missing_prices,
