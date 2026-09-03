@@ -268,6 +268,7 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
     cash_fraction = 1.0 - actual.sum()
     drift_df = ps.check_drift(actual, fresh_target_weights, drift_threshold=ps.DRIFT_THRESHOLD)
     breaches = ps.check_hard_breaches(actual, sectors, cash=cash_fraction)
+    sector_warnings = ps.check_sector_warnings(actual, sectors)
     additions = ps.identify_diversification_additions(held_symbols, ranked, floor=ps.DIVERSIFICATION_FLOOR)
 
     sections = [f"\n\n*Comparison against current holdings -- {escape_md_fn(active['name'])}*"]
@@ -314,8 +315,23 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
             f"-- consider adding:*\n" + "\n".join(escape_md_fn(s) for s in additions)
         )
 
+    if sector_warnings["any_warning"]:
+        any_flag = True
+        warning_lines = [
+            f"{escape_md_fn(sector)}: {_fmt_pct(w)} (warning line {_fmt_pct(ps.SECTOR_WARNING_THRESHOLD)}, "
+            f"hard cap {_fmt_pct(ps.MAX_SECTOR_WEIGHT)})"
+            for sector, w in sector_warnings["sector_warning"].items()
+        ]
+        sections.append(
+            f"*SECTOR EARLY WARNING -- approaching cap, no action required yet:*\n"
+            + "\n".join(warning_lines)
+        )
+
     if not any_flag:
-        sections.append("No hard breaches, no meaningful drift, holdings at/above the diversification floor.")
+        sections.append(
+            "No hard breaches, no meaningful drift, no sector approaching its cap, "
+            "holdings at/above the diversification floor."
+        )
 
     if cash_unavailable:
         sections.append(
@@ -335,7 +351,9 @@ def _compare_against_holdings(chat_id: str, fresh_target_weights: pd.Series, ran
     if breaches["holdings_breach"]:
         db.log_signal_if_new(portfolio_id, "holdings_breach", None, {"holdings_count": len(holdings_list)})
     if breaches["cash_breach"]:
-        db.log_signal_if_new(portfolio_id, "cash_breach", None, {"cash_fraction": cash_fraction})
+        db.log_signal_if_new(portfolio_id, "cash_breach", None, {"cash": cash_fraction})
+    for sector, w in sector_warnings["sector_warning"].items():
+        db.log_signal_if_new(portfolio_id, "sector_warning", sector, {"weight": w})
     for sym, row in triggered.iterrows():
         db.log_signal_if_new(
             portfolio_id, "drift", sym,
