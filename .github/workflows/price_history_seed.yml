@@ -1,0 +1,39 @@
+name: Price History Seed (manual, one-time backfill)
+# Manual-trigger-only companion to daily-price-update.yml -- calls
+# price_history_service.seed_from_repo_panel() via main.py's
+# /price-history-seed endpoint, which backfills price_history from the
+# project's raw_price_history.json panel (real history back to Feb 2026,
+# through ~Aug 10 2026 as of this writing). Idempotent (upserts), so this
+# is always safe to re-run, whether or not it's been run before -- see
+# main.py's /price-history-seed docstring.
+#
+# Deliberately NO schedule -- this is a one-off (or occasional manual)
+# backfill step, not routine daily infrastructure. Trigger it from the
+# Actions tab (works fine from the GitHub mobile app / mobile browser --
+# no terminal or curl needed): Actions -> "Price History Seed (manual,
+# one-time backfill)" -> Run workflow.
+#
+# Uses the SAME RENDER_SERVICE_URL and DAILY_PRICE_UPDATE_SECRET repo
+# secrets as daily-price-update.yml -- /price-history-seed is protected
+# by the same secret on the main.py side (see its docstring: "rather
+# than a third secret -- this endpoint is closely related to
+# /daily-price-update and doesn't need its own").
+"on":
+  workflow_dispatch: {}
+jobs:
+  trigger-price-history-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger /price-history-seed
+        run: |
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            "${{ secrets.RENDER_SERVICE_URL }}/price-history-seed" \
+            -H "Content-Type: application/json" \
+            -H "X-Daily-Price-Update-Secret: ${{ secrets.DAILY_PRICE_UPDATE_SECRET }}")
+          echo "$RESPONSE"
+          STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d: -f2)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Triggering /price-history-seed failed with HTTP $STATUS"
+            exit 1
+          fi
+          echo "Price history seed triggered successfully. Check Render logs for symbols_seeded/rows_upserted."
